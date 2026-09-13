@@ -23,6 +23,9 @@ sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
 The `setcap` grants the one privilege a proxy needs — binding a port below 1024
 — without the daemon ever running as root. Do it once.
 
+If something else already owns `:80` — Apache and nginx usually do — see
+[Port 80](#port-80).
+
 ## Use
 
 Start the daemon (once, or from systemd):
@@ -52,6 +55,93 @@ domain-to-port -d www.example.com -p 8099 --hosts
 It asks for `sudo` only for that step, and only when there is something to
 change. See [Hosts entries](#hosts-entries) for what it will and will not
 touch.
+
+## Port 80
+
+The whole point is typing `http://myapp.test/` with no port in it, which means
+the proxy has to own `:80`. Two things stand between you and that.
+
+### 1. Binding a low port
+
+Ports below 1024 need a capability. Grant it once, to the binary:
+
+```sh
+sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
+```
+
+The daemon then binds `:80` while running as you. It is attached to the file,
+so re-grant it after any reinstall that replaces the binary.
+
+Without it, `vyto-proxyd` exits with the setcap line in the error — but only
+when privilege is actually the problem. If the port is simply taken, it says
+that instead, because on most machines both are true at once and being sent to
+`setcap` first just delays finding the real cause.
+
+### 2. Something else is probably already there
+
+On a machine that has ever done web development, `:80` is usually taken —
+Apache and nginx both install enabled and start at boot. Check before you
+wonder why nothing works:
+
+```sh
+ss -lntp | grep ':80 '
+sudo ss -lntp | grep ':80 '    # add sudo to see WHICH process
+```
+
+Without `sudo`, `ss` shows that the port is taken but not by what — it cannot
+read another user's process names, and a root-owned web server is the usual
+culprit. `curl -sI http://127.0.0.1/ | grep -i ^server` names it too.
+
+If that prints a line, the process in it owns the port, and a browser hitting
+`http://myapp.test/` reaches **that**, not vyto-proxy. The symptom is
+confusing precisely because it half-works: the hostname resolves (your
+`/etc/hosts` entry is fine) and something answers, so it looks like a routing
+bug rather than a port conflict. A default Apache page is the usual tell.
+
+You have three ways out.
+
+**Run vyto-proxy somewhere else.** Simplest, and costs you the clean URL:
+
+```sh
+vyto-proxyd -p 8080
+# http://myapp.test:8080/
+```
+
+**Move the other server and put vyto-proxy in front.** This is the arrangement
+the tool is built for — one thing owning `:80`, routing by name to everything
+else, including the server you displaced. For Apache:
+
+```sh
+# /etc/apache2/ports.conf      Listen 80  ->  Listen 8081
+# /etc/apache2/sites-enabled/*.conf   <VirtualHost *:80>  ->  <VirtualHost *:8081>
+sudo systemctl restart apache2
+
+sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
+domain-to-port -d existing-site.test -p 8081 --hosts    # keep it reachable
+vyto-proxyd
+```
+
+nginx is the same shape: change `listen 80;` to `listen 8081;` in
+`/etc/nginx/sites-enabled/*`, reload, then route a domain at 8081.
+
+Give every vhost you moved its own route, or it becomes unreachable the moment
+vyto-proxy takes the port.
+
+**Stop the other server**, if you were not using it:
+
+```sh
+sudo systemctl disable --now apache2
+```
+
+### Checking it took
+
+```sh
+sudo ss -lntp | grep ':80 '   # should now name vyto-proxyd
+curl -sI http://myapp.test/   # should reach your backend, not a default page
+```
+
+`vyto-proxyd -v` logs every routing decision, which is the quickest way to tell
+"the request never arrived" from "it arrived and had nowhere to go".
 
 ## What it does
 
@@ -247,6 +337,11 @@ overwrite a file it could not read, rather than silently discarding routes.
 **Backends are localhost only.** There is no backend *host* field, on purpose:
 pointing at another machine needs a trust story this does not have.
 
+**Nothing here takes a port away from another program.** If Apache or nginx
+holds `:80`, vyto-proxy refuses to start and says so; it will not stop a service
+for you. Moving the other server is a deliberate decision about a machine the
+tool does not own — see [Port 80](#port-80).
+
 Idle connections are dropped after 60 s, at most 256 at a time, header blocks
 capped at 16 KB.
 
@@ -256,7 +351,7 @@ capped at 16 KB.
 make test
 ```
 
-118 checks: unit tests for the table, the header parser and the hosts-file
+121 checks: unit tests for the table, the header parser and the hosts-file
 rewriter, then end-to-end
 runs against real backends on loopback — routing, wildcards, keep-alive, a
 3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live

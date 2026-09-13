@@ -421,6 +421,31 @@ case "$(cat "$TMP/hf.log")" in
 esac
 unset VYTO_PROXY_HOSTS
 
+# --- bind failures ---------------------------------------------------------
+# "cannot listen" used to always blame privilege, which sends the reader to
+# setcap even when the real problem is that something else holds the port —
+# the common case on a machine with Apache or nginx installed.
+echo "bind failures"
+BUSY=$(freeport)
+python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $BUSY)); s.listen(1); time.sleep(12)" &
+SQUAT=$!
+sleep 1
+"$TMP/vyto-proxyd" -p $BUSY --routes "$TMP/state/routes.json" >"$TMP/busy.log" 2>&1
+BUSYCODE=$?
+kill $SQUAT 2>/dev/null
+want "binding an occupied port exits non-zero" "$BUSYCODE" '1'
+case "$(cat "$TMP/busy.log")" in
+    *"already listening on port"*) ok "an occupied port says so, not 'needs privilege'" ;;
+    *) bad "an occupied port says so, not 'needs privilege'" "said: $(tail -1 "$TMP/busy.log")" ;;
+esac
+case "$(cat "$TMP/busy.log")" in
+    *"setcap"*) bad "an occupied high port does not mention setcap" "it suggested setcap" ;;
+    *) ok "an occupied high port does not mention setcap" ;;
+esac
+
 echo "live reload"
 want "unrouted before add" "$(curl -s -m5 -o /dev/null -w '%{http_code}' -H 'Host: late.local' $H/)" '404'
 RELOAD=$("$DTP" -d late.local -p $B1 | tail -1 | tr -d ' ')

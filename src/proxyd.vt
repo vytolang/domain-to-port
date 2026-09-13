@@ -15,8 +15,8 @@
 // The loop holds one Tunnel per client, indexed in a table by BOTH of its fds,
 // so a poll event on either side finds the same object in one lookup.
 
-import { Socket, PollSet, RecvResult, socket_listen_on, socket_connect_async,
-         POLL_READ, POLL_WRITE, POLL_ERR } from "vyto/net/socket";
+import { Socket, PollSet, RecvResult, socket_listen_on, socket_connect,
+         socket_connect_async, POLL_READ, POLL_WRITE, POLL_ERR } from "vyto/net/socket";
 import { cli, Cli } from "vyto/cli";
 import { exit, getenv } from "vyto/os";
 import { monoMs } from "vyto/util/time";  // monotonic: an idle timeout must not jump when the wall clock does
@@ -504,6 +504,37 @@ export class Proxy {
 
 // ---------------------------------------------------------------------------
 
+// Why did a bind fail?
+//
+// "cannot listen" covers two situations that want opposite responses, and
+// guessing wrong sends the reader somewhere useless: a low port without the
+// capability, and a port somebody else already owns. On a development machine
+// both are often true at once — Apache and nginx install enabled and hold :80 —
+// so a message that only mentions setcap leads you to grant the capability and
+// then fail again for the other reason.
+//
+// Connecting is what distinguishes them. If something accepts, the port is
+// occupied; if nothing does, the bind failed for want of privilege.
+fn explainBindFailure(host: string, port: int) {
+    let probe = socket_connect("127.0.0.1", port);
+    let occupied = probe != null;
+    if (probe != null) { probe.close(); }
+
+    if (occupied) {
+        print(`  something is already listening on port {port}.`);
+        print("  find it with:");
+        print(`    sudo ss -lntp | grep ':{port} '`);
+        print("  then move it, stop it, or run this proxy on another port with -p.");
+        return;
+    }
+    if (port < 1024) {
+        print("  ports below 1024 need privilege. Grant it once with:");
+        print("    sudo setcap cap_net_bind_service=+ep ./vyto-proxyd");
+        return;
+    }
+    print(`  the address {host} may not exist on this machine.`);
+}
+
 fn main() {
     let app = new Cli("vyto-proxyd", "route domains to local ports");
     app.intOption("port", "port to listen on").short("p").meta("PORT").dfltInt(80);
@@ -541,10 +572,7 @@ fn main() {
     let host = app.get("host");
     if (!p.listen(host, port, 512)) {
         print(`vyto-proxyd: cannot listen on {host}:{port}`);
-        if (port < 1024) {
-            print("  ports below 1024 need privilege. Grant it once with:");
-            print("    sudo setcap cap_net_bind_service=+ep ./vyto-proxyd");
-        }
+        explainBindFailure(host, port);
         exit(1);
     }
 
@@ -577,10 +605,7 @@ fn main() {
         let tport = app.getInt("tls-port");
         if (!p.listenTls(host, tport, 512, src.ctx)) {
             print(`vyto-proxyd: cannot listen on {host}:{tport}`);
-            if (tport < 1024) {
-                print("  ports below 1024 need privilege. Grant it once with:");
-                print("    sudo setcap cap_net_bind_service=+ep ./vyto-proxyd");
-            }
+            explainBindFailure(host, tport);
             exit(1);
         }
         if (src.kind == CERT_SELF) {
