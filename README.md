@@ -42,12 +42,16 @@ domain-to-port -d www.example.com --rm        # remove
 domain-to-port --list                         # show the table
 ```
 
-For local development you also need the name to resolve. One line in
-`/etc/hosts` does it:
+For local development you also need the name to resolve. Pass `--hosts` and the
+tool writes the `/etc/hosts` entry too:
 
+```sh
+domain-to-port -d www.example.com -p 8099 --hosts
 ```
-127.0.0.1   www.example.com
-```
+
+It asks for `sudo` only for that step, and only when there is something to
+change. See [Hosts entries](#hosts-entries) for what it will and will not
+touch.
 
 ## What it does
 
@@ -55,6 +59,8 @@ For local development you also need the name to resolve. One line in
   where the longest match wins.
 - **Reloads live.** The CLI writes the table and signals the daemon; in-flight
   connections are untouched.
+- **Writes the `/etc/hosts` entry too**, with `--hosts`, so the name resolves
+  as well as routes.
 - **Explains itself when a backend is down.** A 502 that names the domain and
   the port beats a browser error page with nothing in it.
 - **Passes anything through.** Once a connection is routed it is a byte pipe,
@@ -66,6 +72,62 @@ For local development you also need the name to resolve. One line in
 Measured on the test suite: a 3 MB response arrives byte-identical, 100
 concurrent requests all succeed, and 60 MB of transfers move the daemon's RSS
 by **0 kB**.
+
+## Hosts entries
+
+`--hosts` keeps `/etc/hosts` in step with the route table. It is opt-in: without
+the flag nothing outside the project is ever touched.
+
+```sh
+domain-to-port -d www.example.com -p 8099 --hosts     # add the entry too
+domain-to-port -d www.example.com --rm --hosts        # and take it away again
+domain-to-port -d www.example.com -p 8099 --hosts --dry-run
+```
+
+Entries it writes are marked:
+
+```
+127.0.0.1	www.example.com	# vyto-proxy
+```
+
+**It only ever changes its own lines.** A line without that marker belongs to
+you or to another program and is copied through untouched, even when it names
+the same domain — in which case you get a warning, because that line comes
+first in the file and the first match wins, so your route would not be reached.
+Deleting it is not the tool's call to make; telling you is.
+
+Removing every route the tool added restores the file byte-for-byte.
+
+The whole file is rewritten through a temp file and installed atomically, and a
+result that somehow lost `localhost` is refused rather than written — a
+half-written `/etc/hosts` is a machine that cannot resolve anything, including
+the tools you would use to fix it.
+
+`sudo` is invoked for the install step alone, and only when something actually
+changes. The daemon never needs root for this; nothing here runs privileged for
+longer than one `install` command.
+
+**Wildcards are skipped.** `/etc/hosts` matches literal names only, so a route
+like `*.dev.local` gets a warning rather than a line that could never match.
+For wildcards you need a real resolver — dnsmasq with
+`address=/dev.local/127.0.0.1`, or systemd-resolved — or just list the names
+you actually use.
+
+### Pick the right suffix
+
+Use **`.test`**. It is reserved by RFC 6761 for exactly this and will never be
+delegated.
+
+Avoid **`.local`**: it belongs to mDNS. On a machine running avahi — which is
+most Linux desktops, including the one this was developed on — `nsswitch.conf`
+typically reads `hosts: files mdns4_minimal [NOTFOUND=return] dns`. A hosts
+entry still wins, because `files` comes first, but anything that falls past it
+stops at mDNS instead of reaching DNS, and `.local` names you did not put in
+the file resolve to link-local addresses rather than loopback. The examples in
+this README use `.local` in places for continuity with earlier versions; `.test`
+is the better choice for anything new.
+
+Also fine: `.localhost`, and any domain you actually control.
 
 ## TLS
 
@@ -159,6 +221,7 @@ RSS by about 1 MB, not 30 MB.
 | `src/errors.vt` | the 400/404/502 pages |
 | `src/tls.vt` | certificate acquisition: files, or self-signed |
 | `src/sni.vt` | per-domain certificates, loaded from a directory |
+| `src/hosts.vt` | /etc/hosts reconciliation, marked lines only |
 | `src/signal.vt` | pidfile and SIGHUP |
 
 State lives in `$XDG_STATE_HOME/vyto-proxy` (override with `$VYTO_PROXY_HOME`):
@@ -187,11 +250,14 @@ capped at 16 KB.
 make test
 ```
 
-80 checks: unit tests for the table and the header parser, then end-to-end
+115 checks: unit tests for the table, the header parser and the hosts-file
+rewriter, then end-to-end
 runs against real backends on loopback — routing, wildcards, keep-alive, a
 3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live
 reload, the same payload and concurrency set again over TLS, and SNI serving
-three distinct certificates to the domains that asked for them. No network access, and every port is picked free at run
+three distinct certificates to the domains that asked for them, and
+`/etc/hosts` reconciliation against a copy (never the real file — `$VYTO_PROXY_HOSTS`
+redirects it). No network access, and every port is picked free at run
 time so the suite does not fight whatever else is on the machine.
 
 Two checks are worth keeping honest, and both have been fault-injected to

@@ -1,0 +1,345 @@
+// /etc/hosts, edited safely.
+//
+// A route is only half of "it works instantly": the browser still has to
+// resolve the name. On a dev machine that means /etc/hosts, and this is the
+// part of the tool that touches a file it does not own, outside the project,
+// owned by root. So it is the most conservative code here.
+//
+// THREE RULES
+//
+// 1. Only our own lines are ever changed. Every line this writes carries a
+//    marker comment; a line without one is another program's or the user's, and
+//    is copied through untouched even when it names the same domain. The file
+//    predates this tool and will outlive it.
+//
+// 2. The whole file is rewritten, never appended to in place, and the
+//    replacement goes through a temp file and an atomic install. A half-written
+//    /etc/hosts is a machine that cannot resolve localhost.
+//
+// 3. No data ever reaches a shell. Domains are already allow-listed by
+//    normalize() to [a-z0-9.-], which excludes every shell metacharacter, but
+//    the command this builds is a fixed shape with no interpolated content at
+//    all — the new contents travel through a file, not through argv. Escaping
+//    is a blocklist wearing a disguise; see src/vytopack/safety.vt in the
+//    voltlang tree for the same argument at length.
+
+import { file_exists, file_rename, file_remove, path_join } from "vyto/io/file";
+import { run, capture, tempDir, pid, getenv } from "vyto/os";
+import { normalize } from "vyto-proxy/src/routes";
+
+const DEFAULT_HOSTS: string = "/etc/hosts";
+
+// The hosts file to edit.
+//
+// $VYTO_PROXY_HOSTS overrides it. That exists so the tests can exercise the
+// whole write path against a file they own — editing the real /etc/hosts to
+// check that editing works is not a trade worth making — and it doubles as the
+// escape hatch for a system that keeps the file somewhere else.
+//
+// When it is set, the install runs WITHOUT sudo: a path the user chose is a
+// path the user can presumably write, and asking for root to touch a file in
+// their own home would be both surprising and a way to turn a test into a
+// privileged operation.
+export fn hostsPath(): string {
+    let o = getenv("VYTO_PROXY_HOSTS");
+    if (!o.is_empty()) { return o; }
+    return DEFAULT_HOSTS;
+}
+
+fn needsSudo(): bool { return getenv("VYTO_PROXY_HOSTS").is_empty(); }
+
+// True when `p` is safe to place on a shell command line.
+//
+// An allow-list, following src/vytopack/safety.vt in the voltlang tree:
+// escaping is a blocklist wearing a disguise, since it has to anticipate every
+// metacharacter of a shell we do not control. A path that needs a character
+// outside this set is refused rather than quoted.
+fn pathSafe(p: string): bool {
+    if (p.is_empty() || p.len > 512) { return false; }
+    if (!p.starts_with("/")) { return false; }      // absolute only
+    for (let i in 0..p.len) {
+        let c = p[i];
+        let ok = (c >= 97 && c <= 122)          // a-z
+              || (c >= 65 && c <= 90)           // A-Z
+              || (c >= 48 && c <= 57)           // 0-9
+              || c == 47                        // /
+              || c == 46                        // .
+              || c == 45                        // -
+              || c == 95;                       // _
+        if (!ok) { return false; }
+    }
+    // "/etc/../tmp/x" is absolute and passes the character test but is not the
+    // path it appears to be.
+    if (p.contains("..")) { return false; }
+    return true;
+}
+
+// The marker that makes a line ours. Anything without it is left alone.
+//
+// It names the tool rather than being an opaque token so that somebody reading
+// /etc/hosts a year from now, with no memory of installing this, can tell what
+// wrote the line and what to run to remove it.
+export const MARK: string = "# vyto-proxy";
+
+export const LOOPBACK: string = "127.0.0.1";
+
+// What a sync would do, or did. Kept as counts rather than a bool because
+// "nothing to do" and "added three" deserve different messages.
+export class HostsResult {
+    added: string[];
+    removed: string[];
+    // Domains that already have a line somebody else wrote. Ours is added
+    // anyway, but theirs comes first in the file and the first match wins, so
+    // the route will not be reached. Reporting it is the only honest option:
+    // deleting their line is not ours to do, and staying silent leaves a
+    // failure whose cause is invisible.
+    shadowed: string[];
+    err: string;
+    needs_root: bool;
+
+    fn init() {
+        this.added = [];
+        this.removed = [];
+        this.shadowed = [];
+        this.err = "";
+        this.needs_root = false;
+    }
+
+    fn ok(): bool { return this.err.is_empty(); }
+    fn changed(): bool { return this.added.len > 0 || this.removed.len > 0; }
+    fn hasShadows(): bool { return this.shadowed.len > 0; }
+}
+
+// Is this one of our lines?
+fn isOurs(line: string): bool { return line.contains(MARK); }
+
+// The domain named by one of our lines, or "" if it is not one of ours.
+//
+// Our lines have a fixed shape — "127.0.0.1<TAB>domain<TAB># vyto-proxy" — so
+// this parses only that shape and refuses anything else rather than trying to
+// understand hosts-file syntax in general.
+export fn ourDomain(line: string): string {
+    if (!isOurs(line)) { return ""; }
+    let cut = line.index_of(MARK);
+    if (cut < 0) { return ""; }
+    let head = line.slice(0, cut).trim();
+    // "127.0.0.1 domain"
+    let sp = head.index_of(" ");
+    let tab = head.index_of("\t");
+    if (tab >= 0 && (sp < 0 || tab < sp)) { sp = tab; }
+    if (sp < 0) { return ""; }
+    return normalize(head.slice(sp + 1, head.len).trim());
+}
+
+// Every domain named by a line we did NOT write.
+//
+// A hosts line is "address name [name...]", and a single line can legitimately
+// carry several names. Returning only the first would miss a shadow hiding in
+// second position, which is exactly where an alias tends to live.
+fn foreignDomains(line: string): string[] {
+    let out: string[] = [];
+    let t = line.trim();
+    if (t.is_empty() || t.starts_with("#")) { return out; }
+    let h = t.index_of("#");
+    if (h >= 0) { t = t.slice(0, h).trim(); }
+
+    // Fields are separated by runs of spaces and tabs, so normalise the tabs
+    // to spaces first and then take every non-empty piece.
+    let flat = "";
+    for (let i in 0..t.len) {
+        if (t[i] == 9) { flat = flat + " "; }        // tab
+        else { flat = flat + t.slice(i, i + 1); }
+    }
+
+    let seen_addr = false;
+    for (let raw in flat.split(" ")) {
+        let w = raw.trim();
+        if (w.is_empty()) { continue; }
+        if (!seen_addr) { seen_addr = true; continue; }   // the address field
+        let n = normalize(w);
+        if (!n.is_empty()) { out.push(n); }
+    }
+    return out;
+}
+
+fn lineFor(domain: string): string {
+    return LOOPBACK + "\t" + domain + "\t" + MARK;
+}
+
+// Split on newlines, keeping empty lines so the file's shape survives a
+// round trip.
+fn splitLines(text: string): string[] {
+    let out: string[] = [];
+    let start = 0;
+    let i = 0;
+    while (i < text.len) {
+        if (text[i] == 10) {                 // '\n'
+            out.push(text.slice(start, i));
+            start = i + 1;
+        }
+        i += 1;
+    }
+    if (start < text.len) { out.push(text.slice(start, text.len)); }
+    return out;
+}
+
+// Build what /etc/hosts should contain.
+//
+// `wanted` is the set of domains that should have an entry. Our lines for
+// anything not in that set are dropped; missing ones are appended. Every line
+// that is not ours is preserved exactly, in order.
+//
+// A wildcard route cannot be expressed in /etc/hosts at all — the file matches
+// literal names only — so wildcards are skipped by the caller rather than
+// written as something that would never match.
+export fn rebuild(current: string, wanted: string[], res: HostsResult): string {
+    let lines = splitLines(current);
+    let out: string[] = [];
+
+    // Which of ours are already present, and which should go.
+    let keep = new Map<string, bool>();
+    for (let w in wanted) { keep.set(w, true); }
+
+    let present = new Map<string, bool>();
+
+    for (let line in lines) {
+        let d = ourDomain(line);
+        if (d.is_empty()) {
+            // Not ours, so it is preserved — but if it names a domain we are
+            // about to add, it will shadow our line.
+            for (let f in foreignDomains(line)) {
+                if (keep.has(f)) { res.shadowed.push(f); }
+            }
+            out.push(line);
+            continue;
+        }
+        if (keep.has(d)) {
+            if (present.has(d)) { continue; }   // a duplicate of ours
+            present.set(d, true);
+            out.push(line);
+        } else {
+            res.removed.push(d);
+        }
+    }
+
+    for (let w in wanted) {
+        if (present.has(w)) { continue; }
+        out.push(lineFor(w));
+        res.added.push(w);
+        present.set(w, true);
+    }
+
+    // Join with a trailing newline: a hosts file whose last line has none is
+    // legal but upsets some editors, and every system file here ends with one.
+    let text = "";
+    for (let line in out) { text = text + line + "\n"; }
+    return text;
+}
+
+// Apply `wanted` to /etc/hosts.
+//
+// Writes the candidate to a temp file owned by the user, then installs it with
+// a single fixed-shape sudo command.
+//
+// The file's CONTENTS never touch a command line — they travel through the temp
+// file — so nothing a route or a hosts file contains can reach the shell. The
+// two paths do get interpolated, so both are checked by pathSafe() first. The
+// sudo path only ever runs against the built-in /etc/hosts and a temp name we
+// generated, but a check that depends on an env var being unset is one refactor
+// away from being no check at all.
+export fn sync(wanted: string[], dry: bool): HostsResult {
+    let res = new HostsResult();
+
+    let target = hostsPath();
+    if (!file_exists(target)) {
+        res.err = target + " does not exist";
+        return res;
+    }
+
+    let current = readfile(target);
+    if (current.is_empty()) {
+        // An empty /etc/hosts is not something to "fix" by writing our own:
+        // it means something is very wrong, or it could not be read.
+        res.err = target + " is empty or unreadable";
+        return res;
+    }
+
+    let next = rebuild(current, wanted, res);
+    if (!res.changed()) { return res; }
+    if (dry) { return res; }
+
+    // Sanity: never install a file that lost localhost. This catches a bug in
+    // rebuild() before it costs somebody their name resolution, which is the
+    // kind of mistake that is very hard to debug precisely because it breaks
+    // the tools you would debug it with.
+    if (!next.contains("localhost")) {
+        res.err = "refusing to write a hosts file with no localhost entry";
+        return res;
+    }
+
+    // Where the temp file goes depends on who installs it, and the two cases
+    // want opposite things.
+    //
+    // With sudo, the install is `install`, which COPIES — so the temp file can
+    // live anywhere, and it must, because /etc is not writable by the user who
+    // is about to create it.
+    //
+    // Without sudo (VYTO_PROXY_HOSTS names a file the user owns) the install is
+    // a rename, and rename(2) cannot cross a filesystem. $TMPDIR is very often
+    // its own mount, so the temp file has to be a sibling of the target or the
+    // rename fails with EXDEV. A sibling is also what makes that rename atomic
+    // with respect to the target, which is what keeps a half-written hosts file
+    // impossible.
+    let tmp = "";
+    if (needsSudo()) { tmp = path_join(tempDir(), "vyto-proxy-hosts." + str(pid())); }
+    else { tmp = target + ".vyto-proxy." + str(pid()); }
+
+    if (!writefile(tmp, next)) {
+        res.err = "cannot write " + tmp;
+        return res;
+    }
+
+    // A file the user chose is one they can presumably write, so no privilege
+    // is asked for and the rename is enough.
+    if (!needsSudo()) {
+        if (!file_rename(tmp, target)) {
+            file_remove(tmp);
+            res.err = "cannot replace " + target;
+            return res;
+        }
+        return res;
+    }
+
+    // One fixed command. `install` sets the mode explicitly so the result is
+    // 0644 root:root regardless of the user's umask — a /etc/hosts that is
+    // group-writable would be a real problem, and a temp file's mode must not
+    // decide it.
+    if (!pathSafe(tmp) || !pathSafe(target)) {
+        file_remove(tmp);
+        res.err = "refusing to run sudo with a path that needs shell quoting";
+        return res;
+    }
+
+    let cmd = "sudo -n install -m 0644 -o root -g root " + tmp + " " + target;
+    let probe = capture(cmd + " 2>&1");
+    if (probe == null) {
+        file_remove(tmp);
+        res.err = "could not run sudo";
+        return res;
+    }
+    if (!probe.ok()) {
+        // -n means "never prompt", so the usual failure here is simply that
+        // sudo wants a password. Retry interactively: the user sees the prompt
+        // and can decline, which is the point of doing this per-operation
+        // rather than holding privilege for the tool's whole life.
+        res.needs_root = true;
+        let rc = run("sudo install -m 0644 -o root -g root " + tmp + " " + target);
+        if (rc != 0) {
+            file_remove(tmp);
+            res.err = "could not update " + target;
+            return res;
+        }
+    }
+    file_remove(tmp);
+    return res;
+}

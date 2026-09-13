@@ -56,7 +56,8 @@ DTP="$TMP/domain-to-port"
 echo "unit tests"
 $VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1 | sed 's/^/  /'
 $VYTOC run tests/t_head.vt   --modpath /home/eric 2>&1 | sed 's/^/  /'
-U=$($VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_head.vt --modpath /home/eric 2>&1)
+$VYTOC run tests/t_hosts.vt  --modpath /home/eric 2>&1 | sed 's/^/  /'
+U=$($VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_head.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_hosts.vt --modpath /home/eric 2>&1)
 UF=$(printf '%s\n' "$U" | grep -c '^FAIL')
 UP=$(printf '%s\n' "$U" | grep -c '^ok')
 PASS=$((PASS+UP)); FAIL=$((FAIL+UF))
@@ -306,6 +307,93 @@ case "$(cat "$TMP/nodir.log")" in
     *"no such directory"*) ok "a missing --certs directory is reported, not a panic" ;;
     *) bad "a missing --certs directory is reported, not a panic" "said: $(head -1 "$TMP/nodir.log")" ;;
 esac
+
+
+# --- /etc/hosts ------------------------------------------------------------
+# Against a copy, never the real file: VYTO_PROXY_HOSTS redirects the target and
+# also drops the sudo step, since a path the user chose is one they can write.
+# Editing the machine's real /etc/hosts to prove that editing works is not a
+# trade worth making.
+echo "hosts"
+FAKE="$TMP/fake-hosts"
+printf '127.0.0.1\tlocalhost\n192.168.1.50 taken.test\n' > "$FAKE"
+cp "$FAKE" "$TMP/fake-hosts.orig"
+export VYTO_PROXY_HOSTS="$FAKE"
+
+"$DTP" -d hostsy.test -p $B1 --hosts >"$TMP/h1.log" 2>&1
+case "$(cat "$TMP/h1.log")" in
+    *"hosts: added hostsy.test"*) ok "--hosts adds an entry" ;;
+    *) bad "--hosts adds an entry" "said: $(grep hosts: "$TMP/h1.log" | head -1)" ;;
+esac
+grep -q "^127.0.0.1	hostsy.test	# vyto-proxy$" "$FAKE" \
+    && ok "the entry is marked as ours" \
+    || bad "the entry is marked as ours" "file has: $(tail -1 "$FAKE")"
+grep -q "^127.0.0.1	localhost$" "$FAKE" \
+    && ok "localhost survives the rewrite" \
+    || bad "localhost survives the rewrite" "localhost line is gone"
+
+# Re-running must change nothing: this is what makes the flag safe to pass
+# every time rather than only on the first add.
+"$DTP" -d hostsy.test -p $B1 --hosts >"$TMP/h2.log" 2>&1
+case "$(cat "$TMP/h2.log")" in
+    *"already up to date"*) ok "a second --hosts run is a no-op" ;;
+    *) bad "a second --hosts run is a no-op" "said: $(grep hosts: "$TMP/h2.log" | head -1)" ;;
+esac
+
+# A line somebody else wrote is never touched, even for a domain we manage.
+"$DTP" -d taken.test -p $B1 --hosts >"$TMP/h3.log" 2>&1
+grep -q "^192.168.1.50 taken.test$" "$FAKE" \
+    && ok "a hand-written entry is preserved" \
+    || bad "a hand-written entry is preserved" "it was modified or removed"
+case "$(cat "$TMP/h3.log")" in
+    *"already has an entry written by someone else"*) ok "a shadowing entry is reported" ;;
+    *) bad "a shadowing entry is reported" "no warning was printed" ;;
+esac
+
+# A wildcard cannot be expressed in a hosts file, so it must be refused loudly
+# rather than written as a line that would never match.
+"$DTP" -d '*.wild.test' -p $B1 --hosts >"$TMP/h4.log" 2>&1
+case "$(cat "$TMP/h4.log")" in
+    *"wildcard route(s) skipped"*) ok "wildcards are skipped with a reason" ;;
+    *) bad "wildcards are skipped with a reason" "no wildcard notice" ;;
+esac
+grep -q "wild.test" "$FAKE" && bad "no wildcard line is written" "found one" \
+                            || ok "no wildcard line is written"
+
+# --dry-run reports without touching the file.
+BEFORE=$(md5sum "$FAKE" | cut -d' ' -f1)
+"$DTP" -d dry.test -p $B1 --hosts --dry-run >"$TMP/h5.log" 2>&1
+AFTER=$(md5sum "$FAKE" | cut -d' ' -f1)
+want "--dry-run leaves the file alone" "$AFTER" "$BEFORE"
+case "$(cat "$TMP/h5.log")" in
+    *"would add dry.test"*) ok "--dry-run says what it would do" ;;
+    *) bad "--dry-run says what it would do" "said: $(grep hosts: "$TMP/h5.log" | head -1)" ;;
+esac
+
+# Removing every route must restore the file exactly.
+#
+# In its own state dir with its own route table: sync() reconciles against the
+# WHOLE table, so with the suite's other routes still present the file would
+# correctly keep an entry for each of them, and "restored" would be measuring
+# the wrong thing.
+ISO="$TMP/iso-state"
+mkdir -p "$ISO"
+printf '127.0.0.1\tlocalhost\n192.168.1.50 taken.test\n' > "$TMP/iso-hosts"
+cp "$TMP/iso-hosts" "$TMP/iso-hosts.orig"
+(
+    export VYTO_PROXY_HOME="$ISO"
+    export VYTO_PROXY_HOSTS="$TMP/iso-hosts"
+    "$DTP" -d one.test -p 1234 --hosts >/dev/null 2>&1
+    "$DTP" -d two.test -p 1235 --hosts >/dev/null 2>&1
+    "$DTP" -d one.test --rm --hosts   >/dev/null 2>&1
+    "$DTP" -d two.test --rm --hosts   >/dev/null 2>&1
+)
+if diff -q "$TMP/iso-hosts.orig" "$TMP/iso-hosts" >/dev/null 2>&1; then
+    ok "removing every route restores the file byte-for-byte"
+else
+    bad "removing every route restores the file byte-for-byte" "$(diff "$TMP/iso-hosts.orig" "$TMP/iso-hosts" | head -3)"
+fi
+unset VYTO_PROXY_HOSTS
 
 echo "live reload"
 want "unrouted before add" "$(curl -s -m5 -o /dev/null -w '%{http_code}' -H 'Host: late.local' $H/)" '404'

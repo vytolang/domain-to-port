@@ -1,0 +1,97 @@
+import { rebuild, ourDomain, HostsResult, MARK, LOOPBACK } from "vyto-proxy/src/hosts";
+
+fn checks(label: string, got: string, want: string) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}:\n  got  "{got}"\n  want "{want}"`);
+}
+
+fn check(label: string, got: int, want: int) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got {got}, want {want}`);
+}
+
+// The real file from this machine, including a hand-written entry.
+const REAL: string = "127.0.0.1\tlocalhost\n127.0.1.1\teric-linux\n\n# The following lines are desirable for IPv6 capable hosts\n::1     ip6-localhost ip6-loopback\nff02::1 ip6-allnodes\n127.0.0.1 logistica.test\n";
+
+fn main() {
+    checks("ourDomain reads our line",
+        ourDomain(LOOPBACK + "\tapp.test\t" + MARK), "app.test");
+    checks("ourDomain ignores a foreign line",
+        ourDomain("127.0.0.1 logistica.test"), "");
+    checks("ourDomain ignores localhost",
+        ourDomain("127.0.0.1\tlocalhost"), "");
+
+    // --- adding to a real file ---
+    let r1 = new HostsResult();
+    let out1 = rebuild(REAL, ["app.test"], r1);
+    check("one add", r1.added.len, 1);
+    check("no removals", r1.removed.len, 0);
+    if (out1.contains("127.0.0.1 logistica.test")) { print("ok   hand-written line survives"); }
+    else { print("FAIL hand-written line survives"); }
+    if (out1.contains("localhost")) { print("ok   localhost survives"); }
+    else { print("FAIL localhost survives"); }
+    if (out1.contains("ip6-allnodes")) { print("ok   ipv6 block survives"); }
+    else { print("FAIL ipv6 block survives"); }
+    if (out1.contains("app.test\t" + MARK)) { print("ok   new line is marked"); }
+    else { print("FAIL new line is marked"); }
+
+    // --- idempotence: syncing the same set twice changes nothing ---
+    let r2 = new HostsResult();
+    let out2 = rebuild(out1, ["app.test"], r2);
+    check("second sync adds nothing", r2.added.len, 0);
+    check("second sync removes nothing", r2.removed.len, 0);
+    checks("second sync is byte-identical", out2, out1);
+
+    // --- removal ---
+    let r3 = new HostsResult();
+    let out3 = rebuild(out1, [], r3);
+    check("dropping the route removes our line", r3.removed.len, 1);
+    if (!out3.contains("app.test")) { print("ok   our line is gone"); }
+    else { print("FAIL our line is gone"); }
+    if (out3.contains("logistica.test")) { print("ok   foreign line still there after removal"); }
+    else { print("FAIL foreign line still there after removal"); }
+
+    // --- the critical case: a hand-written line for a domain we also manage ---
+    let mixed = "127.0.0.1\tlocalhost\n127.0.0.1 app.test\n";
+    let r4 = new HostsResult();
+    let out4 = rebuild(mixed, ["app.test"], r4);
+    check("a hand-written duplicate is not removed", r4.removed.len, 0);
+    if (out4.contains("127.0.0.1 app.test\n")) { print("ok   hand-written entry preserved verbatim"); }
+    else { print("FAIL hand-written entry preserved verbatim"); }
+    check("we still add our own marked line", r4.added.len, 1);
+
+    // --- duplicates of OUR line are collapsed ---
+    let dup = "127.0.0.1\tlocalhost\n" + LOOPBACK + "\tx.test\t" + MARK + "\n" + LOOPBACK + "\tx.test\t" + MARK + "\n";
+    let r5 = new HostsResult();
+    let out5 = rebuild(dup, ["x.test"], r5);
+    let n = 0;
+    let i = 0;
+    while (i + 6 <= out5.len) {
+        if (out5.slice(i, i + 6) == "x.test") { n += 1; }
+        i += 1;
+    }
+    check("duplicate of our own line is collapsed", n, 1);
+
+    // --- many domains at once ---
+    let r6 = new HostsResult();
+    let out6 = rebuild(REAL, ["a.test", "b.test", "c.test"], r6);
+    check("three adds", r6.added.len, 3);
+    if (out6.contains("a.test") && out6.contains("b.test") && out6.contains("c.test")) {
+        print("ok   all three present");
+    } else { print("FAIL all three present"); }
+
+    // --- swapping the set removes the old and adds the new in one pass ---
+    let r7 = new HostsResult();
+    let out7 = rebuild(out6, ["b.test", "d.test"], r7);
+    check("one add on swap", r7.added.len, 1);
+    check("two removals on swap", r7.removed.len, 2);
+    // Match whole marked lines, not substrings: "logistica.test" contains
+    // "a.test", which made an earlier version of this test fail against
+    // perfectly correct output.
+    let has_a = out7.contains("\ta.test\t");
+    let has_b = out7.contains("\tb.test\t");
+    let has_d = out7.contains("\td.test\t");
+    if (!has_a && has_b && has_d) {
+        print("ok   swap kept b, dropped a and c, added d");
+    } else { print(`FAIL swap kept b, dropped a and c, added d (a={has_a} b={has_b} d={has_d})`); }
+}

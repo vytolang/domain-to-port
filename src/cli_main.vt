@@ -20,6 +20,7 @@ import { Table, Route, readTable, writeTable, normalize, valid_port } from "vyto
 import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
 import { signalDaemon, SIGHUP, REACH_OK, REACH_NO_FILE, REACH_STALE,
          REACH_DENIED, REACH_BAD_FILE } from "vyto-proxy/src/signal";
+import { sync, HostsResult, hostsPath } from "vyto-proxy/src/hosts";
 
 export const VERSION: string = "0.1.0";
 
@@ -30,6 +31,8 @@ fn main() {
     app.intOption("port", "the local port to send it to").short("p").meta("PORT");
     app.flag("rm", "remove the route for --domain instead of adding one");
     app.flag("list", "print the current table and exit").short("l");
+    app.flag("hosts", "also add or remove the /etc/hosts entry (needs sudo)");
+    app.flag("dry-run", "with --hosts, say what would change without changing it");
     app.flag("version", "print the version and exit");
 
     if (!app.parse(args())) {
@@ -66,7 +69,7 @@ fn main() {
         exit(2);
     }
 
-    if (app.on("rm")) { doRemove(t, path, domain); return; }
+    if (app.on("rm")) { doRemove(t, path, domain, app.on("hosts"), app.on("dry-run")); return; }
 
     if (!app.seen("port")) {
         print("domain-to-port: --port is required when adding a route");
@@ -78,10 +81,10 @@ fn main() {
         print(`domain-to-port: port {port} is outside 1-65535`);
         exit(2);
     }
-    doAdd(t, path, domain, port);
+    doAdd(t, path, domain, port, app.on("hosts"), app.on("dry-run"));
 }
 
-fn doAdd(t: Table, path: string, domain: string, port: int) {
+fn doAdd(t: Table, path: string, domain: string, port: int, hosts: bool, dry: bool) {
     let had = t.lookup(normalize(domain));
     t.put(domain, port);
     if (!writeTable(path, t)) {
@@ -92,9 +95,10 @@ fn doAdd(t: Table, path: string, domain: string, port: int) {
     else if (had != 0) { print(`{domain} -> :{port} (was :{had})`); }
     else { print(`{domain} -> :{port}`); }
     reportReload();
+    if (hosts) { syncHosts(t, dry); }
 }
 
-fn doRemove(t: Table, path: string, domain: string) {
+fn doRemove(t: Table, path: string, domain: string, hosts: bool, dry: bool) {
     if (!t.remove(domain)) {
         print(`domain-to-port: no route for {domain}`);
         exit(1);
@@ -105,6 +109,47 @@ fn doRemove(t: Table, path: string, domain: string) {
     }
     print(`removed {domain}`);
     reportReload();
+    if (hosts) { syncHosts(t, dry); }
+}
+
+
+// Reconcile /etc/hosts with the route table.
+//
+// Wildcards are skipped: /etc/hosts matches literal names only, so an entry for
+// "*.dev.local" would sit there looking like it worked while resolving nothing.
+// Saying so is better than writing a line that cannot help.
+fn syncHosts(t: Table, dry: bool) {
+    let wanted: string[] = [];
+    let wilds = 0;
+    for (let r in t.all()) {
+        if (r.wild) { wilds += 1; continue; }
+        wanted.push(r.domain);
+    }
+
+    let res = sync(wanted, dry);
+    if (!res.ok()) {
+        print(`  hosts: {res.err}`);
+        return;
+    }
+    if (!res.changed()) {
+        print(`  hosts: already up to date`);
+    } else if (dry) {
+        for (let d in res.added) { print(`  hosts: would add {d}`); }
+        for (let d in res.removed) { print(`  hosts: would remove {d}`); }
+    } else {
+        for (let d in res.added) { print(`  hosts: added {d}`); }
+        for (let d in res.removed) { print(`  hosts: removed {d}`); }
+    }
+
+    for (let d in res.shadowed) {
+        print(`  hosts: WARNING {d} already has an entry written by someone else`);
+        print(`         that line comes first, so it wins — remove it from {hostsPath()} to use this route`);
+    }
+
+    if (wilds > 0) {
+        print(`  hosts: {wilds} wildcard route(s) skipped — /etc/hosts cannot match a wildcard`);
+        print("         point those names at 127.0.0.1 with a local DNS resolver, or list them individually");
+    }
 }
 
 fn listTable(t: Table, path: string) {
