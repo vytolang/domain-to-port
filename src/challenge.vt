@@ -1,0 +1,66 @@
+// The HTTP-01 challenge store.
+//
+// A CA proves you control a domain by fetching
+// http://<domain>/.well-known/acme-challenge/<token> and comparing the body to
+// "<token>.<thumbprint>". The proxy is already the thing listening on port 80
+// for that domain, so it answers directly — no webroot, no second server, and
+// nothing to configure.
+//
+// In memory, not on disk. A challenge is valid for seconds and only while an
+// issuance is in flight; writing it to a file would leave the token readable
+// afterwards and add a cleanup path that has to run even when issuance fails.
+
+export const PREFIX: string = "/.well-known/acme-challenge/";
+
+export class Store {
+    // token -> key authorization
+    tokens: Map<string, string>;
+
+    fn init() { this.tokens = new Map<string, string>(); }
+
+    fn put(token: string, keyauth: string) { this.tokens.set(token, keyauth); }
+    fn drop(token: string) { if (this.tokens.has(token)) { this.tokens.remove(token); } }
+    fn count(): int { return this.tokens.keys().len; }
+
+    // The answer for a request path, or "" when this is not a challenge we are
+    // serving. Returning "" for an unknown token rather than a 404 page is the
+    // caller's decision; this only knows about tokens.
+    fn answer(path: string): string {
+        if (!path.starts_with(PREFIX)) { return ""; }
+        let token = path.slice(PREFIX.len, path.len);
+        // A token is base64url; anything else cannot be one of ours and must
+        // not reach the map, which is also what keeps a traversal like
+        // "../../etc/passwd" from being looked up at all.
+        if (!tokenOk(token)) { return ""; }
+        if (!this.tokens.has(token)) { return ""; }
+        return this.tokens.get(token);
+    }
+}
+
+// base64url only: letters, digits, '-' and '_'.
+fn tokenOk(t: string): bool {
+    if (t.is_empty() || t.len > 256) { return false; }
+    let i = 0;
+    while (i < t.len) {
+        let c = t[i];
+        let ok = (c >= 97 && c <= 122)      // a-z
+              || (c >= 65 && c <= 90)       // A-Z
+              || (c >= 48 && c <= 57)       // 0-9
+              || c == 45 || c == 95;        // - _
+        if (!ok) { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+// The response for a solved challenge. Plain text, exactly the key
+// authorization and nothing else — a CA compares the whole body.
+export fn challengeResponse(keyauth: string): string {
+    let crlf = "\r\n";
+    return "HTTP/1.1 200 OK" + crlf
+         + "Content-Type: text/plain" + crlf
+         + "Content-Length: " + str(keyauth.len) + crlf
+         + "Connection: close" + crlf
+         + crlf
+         + keyauth;
+}

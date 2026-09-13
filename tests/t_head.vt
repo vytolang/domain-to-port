@@ -1,4 +1,4 @@
-import { headEnd, hostHeader, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
 
 fn b(s: string): byte[] { return strbytes_of(s); }
 
@@ -54,6 +54,14 @@ fn main() {
     let i = 0;
     while (i < big.len) { big[i] = 65 as byte; i += 1; }
     check("oversize head refused", headEnd(big, big.len), HEAD_TOO_LARGE);
+
+    checks("request path", requestPath(req, req.len), "/");
+    let deep = b("GET /.well-known/acme-challenge/tok123 HTTP/1.1\r\nHost: a.com\r\n\r\n");
+    checks("challenge path", requestPath(deep, deep.len), "/.well-known/acme-challenge/tok123");
+    let q = b("GET /a/b?x=1&y=2 HTTP/1.1\r\nHost: a.com\r\n\r\n");
+    checks("query string dropped", requestPath(q, q.len), "/a/b");
+    let junk = b("\r\n\r\n");
+    checks("junk has no path", requestPath(junk, junk.len), "");
 
     // Folded/continued header lines are legal-ish but obsolete; we just need
     // not to crash or mis-read them.

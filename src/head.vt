@@ -35,6 +35,57 @@ const CH_NUL:   int = 0;
 const CH_A:     int = 65;
 const CH_Z:     int = 90;
 const CH_LOWER_DELTA: int = 32;
+const CH_QUERY: int = 63;      // '?'
+
+// The request target from the request line: "GET /a/b HTTP/1.1" -> "/a/b".
+//
+// Added for the ACME challenge path, which is the one case where the proxy has
+// to look at what was requested rather than only at which host. The query
+// string is dropped: a challenge URL has none, and keeping it would mean every
+// comparison had to strip it anyway.
+//
+// Returns "" for anything that does not look like a request line, which the
+// caller treats as "not a challenge" and routes normally.
+export fn requestPath(buf: byte[], used: int): string {
+    // First space ends the method, second ends the target.
+    let sp1 = -1;
+    let i = 0;
+    while (i < used && i < 512) {
+        if (buf[i] == CH_SP) { sp1 = i; break; }
+        if (buf[i] == CH_CR || buf[i] == CH_LF) { return ""; }
+        i += 1;
+    }
+    if (sp1 < 0) { return ""; }
+
+    let start = sp1 + 1;
+    let end = -1;
+    i = start;
+    while (i < used && i < 8192) {
+        let c = buf[i];
+        if (c == CH_SP || c == CH_CR || c == CH_LF) { end = i; break; }
+        i += 1;
+    }
+    if (end <= start) { return ""; }
+
+    // Stop at a query string.
+    let q = start;
+    while (q < end) {
+        if (buf[q] == CH_QUERY) { end = q; break; }
+        q += 1;
+    }
+
+    let n = end - start;
+    if (n <= 0 || n > 2048) { return ""; }
+    let out = bytes(n);
+    let j = 0;
+    while (j < n) {
+        let c = buf[start + j];
+        if (c == CH_NUL) { return ""; }
+        out[j] = c as byte;
+        j += 1;
+    }
+    return strbytes(out, n);
+}
 
 // Where the header block ends: the offset just past CRLFCRLF, or a HEAD_*
 // code. Also accepts a bare LFLF, which some clients still emit and every

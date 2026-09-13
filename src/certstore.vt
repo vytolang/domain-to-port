@@ -1,0 +1,96 @@
+// Certificates on disk, and knowing when to renew them.
+//
+// ACME-issued certificates live in the same directory --certs already reads,
+// under the same <domain>.crt/.key naming, so an automatically issued
+// certificate and a hand-placed one are indistinguishable to the rest of the
+// proxy. That is deliberate: one code path serves them, and you can drop a real
+// certificate in beside an issued one without telling anything.
+//
+// Renewal is a property of the certificate, not of a schedule we keep: the
+// expiry is read from the file. Nothing to get out of sync, and a certificate
+// replaced by hand is picked up on the next check.
+
+import { cert_from_pem, Cert } from "vyto/crypto/openssl";
+import { file_exists, file_rename, file_remove, path_join } from "vyto/io/file";
+import { nowMs } from "vyto/util/time";
+
+// Renew this long before expiry.
+//
+// 30 days is what every ACME client uses and what Let's Encrypt's own guidance
+// assumes: a 90-day certificate renewed at 60 days leaves a full month of
+// retries before anything breaks, which is enough to survive a CA outage, a
+// misconfigured DNS change, or a machine that was off for a fortnight.
+export const RENEW_BEFORE_DAYS: int = 30;
+
+const MS_PER_DAY: i64 = 86400000;
+
+export class CertInfo {
+    domain: string;
+    cert_path: string;
+    key_path: string;
+    not_after: i64;     // unix seconds, 0 when unknown
+    err: string;
+
+    fn init(domain: string, cert_path: string, key_path: string) {
+        this.domain = domain;
+        this.cert_path = cert_path;
+        this.key_path = key_path;
+        this.not_after = 0;
+        this.err = "";
+    }
+
+    fn exists(): bool { return file_exists(this.cert_path) && file_exists(this.key_path); }
+
+    // Days until expiry; negative once expired. A certificate we cannot read
+    // reports 0, which reads as "renew now" — the safe direction, since an
+    // unreadable certificate is not serving anyone either.
+    fn daysLeft(): int {
+        if (this.not_after <= 0) { return 0; }
+        let now_s = nowMs() / 1000;
+        return ((this.not_after - now_s) / 86400) as int;
+    }
+
+    fn needsRenewal(): bool { return this.daysLeft() < RENEW_BEFORE_DAYS; }
+}
+
+// Where a domain's files live. The wildcard "*." becomes "_." so the name is
+// shell-safe, matching what src/sni.vt already reads.
+export fn stemFor(domain: string): string {
+    if (domain.starts_with("*.")) { return "_." + domain.slice(2, domain.len); }
+    return domain;
+}
+
+export fn infoFor(dir: string, domain: string): CertInfo {
+    let stem = stemFor(domain);
+    let info = new CertInfo(domain, path_join(dir, stem + ".crt"), path_join(dir, stem + ".key"));
+    if (!info.exists()) { return info; }
+
+    let pem = readfile(info.cert_path);
+    if (pem.is_empty()) { info.err = "the certificate file is empty"; return info; }
+    let c = cert_from_pem(pem);
+    if (c == null) { info.err = "the certificate could not be parsed"; return info; }
+    info.not_after = c.notAfter as i64;
+    return info;
+}
+
+// Save an issued certificate and its key.
+//
+// Written through temp files and renamed, so a reader — including this proxy
+// reloading — never sees half a certificate. The key is written first: a
+// certificate present without its key is the state that breaks a restart, and
+// this ordering makes it the one that cannot happen.
+export fn save(dir: string, domain: string, chain_pem: string, key_pem: string): string {
+    if (chain_pem.is_empty() || key_pem.is_empty()) { return "nothing to save"; }
+    let stem = stemFor(domain);
+    let cert_path = path_join(dir, stem + ".crt");
+    let key_path = path_join(dir, stem + ".key");
+
+    let ktmp = key_path + ".tmp";
+    if (!writefile(ktmp, key_pem)) { return "cannot write " + ktmp; }
+    if (!file_rename(ktmp, key_path)) { file_remove(ktmp); return "cannot replace " + key_path; }
+
+    let ctmp = cert_path + ".tmp";
+    if (!writefile(ctmp, chain_pem)) { return "cannot write " + ctmp; }
+    if (!file_rename(ctmp, cert_path)) { file_remove(ctmp); return "cannot replace " + cert_path; }
+    return "";
+}

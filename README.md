@@ -158,6 +158,8 @@ curl -sI http://myapp.test/   # should reach your backend, not a default page
   proxy has never heard of all work without it understanding them.
 - **Terminates TLS** with `--tls`, generates its own certificate if you have
   none, and serves a per-domain certificate via SNI when you do.
+- **Gets real certificates** from Let's Encrypt with `--acme`, answering the
+  challenge itself and renewing on its own.
 
 Measured on the test suite: a 3 MB response arrives byte-identical, 100
 concurrent requests all succeed, and 60 MB of transfers move the daemon's RSS
@@ -280,6 +282,53 @@ certificates: swapping certificates under live connections would mean keeping
 the old set alive for their lifetime, and a proxy that can be restarted for a
 certificate change does not need that.
 
+### Real certificates, automatically
+
+`--acme` gets certificates from Let's Encrypt and renews them, with no cron
+entry and nothing to remember:
+
+```sh
+vyto-proxyd --tls --certs ./certs --acme --acme-email you@example.com
+```
+
+Use staging until it works. Production rate limits lock you out for a week, and
+a staging certificate proves the whole flow without spending that budget:
+
+```sh
+vyto-proxyd --tls --certs ./certs --acme --acme-staging --acme-email you@example.com
+```
+
+Issued certificates land in `--certs` under the same `<domain>.crt`/`.key`
+names a hand-placed one uses, so the two are indistinguishable to everything
+else and you can mix them freely.
+
+**The proxy answers its own challenge.** Let's Encrypt fetches
+`http://<domain>/.well-known/acme-challenge/<token>`, and the proxy is already
+the thing listening there, so there is no webroot to configure and no second
+server to run. That also means the requirements are just:
+
+- the domain resolves publicly to this machine
+- port 80 reaches the proxy from the internet
+- `--certs` is writable
+
+Renewal is checked daily and starts at 30 days of remaining life, which leaves
+thirty chances to succeed before anything expires. A new certificate is loaded
+without a restart. A renewal that fails leaves the existing certificate serving
+and logs why — a certificate with a fortnight left is worth more than a correct
+error message.
+
+**Wildcards are not covered.** `*.example.com` needs DNS-01, which means
+credentials for your DNS provider; `--acme` refuses one with that reason rather
+than failing obscurely half a minute later.
+
+The account key is written once to `<certs>/account.key` and reused. It *is*
+the account as far as the CA is concerned, so keep it: a new key is a new
+account with its own rate-limit budget.
+
+For a private or test ACME server, `--acme-ca` points at its directory and
+`--acme-ca-file` trusts its CA. There is deliberately no way to switch
+certificate verification off.
+
 ## How it works
 
 One process, one epoll loop, non-blocking sockets throughout. No threads —
@@ -318,6 +367,11 @@ RSS by about 1 MB, not 30 MB.
 | `src/tls.vt` | certificate acquisition: files, or self-signed |
 | `src/sni.vt` | per-domain certificates, loaded from a directory |
 | `src/hosts.vt` | /etc/hosts reconciliation, marked lines only |
+| `src/acme.vt` | the ACME protocol: orders, challenges, issuance |
+| `src/jws.vt` | the account key and the JWS every request is signed with |
+| `src/challenge.vt` | live http-01 tokens, answered before routing |
+| `src/certstore.vt` | certificates on disk, and when to renew them |
+| `src/autocert.vt` | issuance and renewal while the proxy runs |
 | `src/signal.vt` | pidfile and SIGHUP |
 
 State lives in `$XDG_STATE_HOME/vyto-proxy` (override with `$VYTO_PROXY_HOME`):
@@ -351,14 +405,18 @@ capped at 16 KB.
 make test
 ```
 
-121 checks: unit tests for the table, the header parser and the hosts-file
+154 checks: unit tests for the table, the header parser and the hosts-file
 rewriter, then end-to-end
 runs against real backends on loopback — routing, wildcards, keep-alive, a
 3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live
 reload, the same payload and concurrency set again over TLS, and SNI serving
-three distinct certificates to the domains that asked for them, and
+three distinct certificates to the domains that asked for them,
 `/etc/hosts` reconciliation against a copy (never the real file — `$VYTO_PROXY_HOSTS`
-redirects it). No network access, and every port is picked free at run
+redirects it), and a full ACME issuance against Pebble, Let's Encrypt's own test
+server — the daemon obtains a certificate, answers its own challenge, and serves
+the result without a restart. The ACME section is skipped when Pebble is not
+installed (`go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest`), so
+the suite stays runnable with no Go toolchain. No network access, and every port is picked free at run
 time so the suite does not fight whatever else is on the machine.
 
 Two checks are worth keeping honest, and both have been fault-injected to

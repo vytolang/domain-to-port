@@ -57,7 +57,8 @@ echo "unit tests"
 $VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1 | sed 's/^/  /'
 $VYTOC run tests/t_head.vt   --modpath /home/eric 2>&1 | sed 's/^/  /'
 $VYTOC run tests/t_hosts.vt  --modpath /home/eric 2>&1 | sed 's/^/  /'
-U=$($VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_head.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_hosts.vt --modpath /home/eric 2>&1)
+$VYTOC run tests/t_acme.vt   --modpath /home/eric 2>&1 | sed 's/^/  /'
+U=$($VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_head.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_hosts.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_acme.vt --modpath /home/eric 2>&1)
 UF=$(printf '%s\n' "$U" | grep -c '^FAIL')
 UP=$(printf '%s\n' "$U" | grep -c '^ok')
 PASS=$((PASS+UP)); FAIL=$((FAIL+UF))
@@ -445,6 +446,89 @@ case "$(cat "$TMP/busy.log")" in
     *"setcap"*) bad "an occupied high port does not mention setcap" "it suggested setcap" ;;
     *) ok "an occupied high port does not mention setcap" ;;
 esac
+
+
+# --- ACME ------------------------------------------------------------------
+# Against Pebble, Let's Encrypt's own test server: the full protocol with no
+# rate limits and no public domain. Skipped when it is not installed, so the
+# suite stays runnable on a machine with no Go toolchain.
+#
+# Pebble validates HTTP-01 against port 5002, which is why the proxy listens
+# there rather than on 80 — no privilege needed.
+PEBBLE="${PEBBLE:-$HOME/go/bin/pebble}"
+PEBBLE_SRC=$(ls -d "$HOME"/go/pkg/mod/github.com/letsencrypt/pebble/v2@* 2>/dev/null | tail -1)
+if [ -x "$PEBBLE" ] && [ -n "$PEBBLE_SRC" ]; then
+    echo "acme (pebble)"
+    mkdir -p "$TMP/pebble"
+    cp -r "$PEBBLE_SRC/test" "$TMP/pebble/" 2>/dev/null
+    chmod -R u+w "$TMP/pebble"
+    ( cd "$TMP/pebble" && "$PEBBLE" -config test/config/pebble-config.json >"$TMP/pebble.log" 2>&1 ) &
+    PEBBLE_PID=$!
+    sleep 3
+
+    if curl -sk -m5 https://127.0.0.1:14000/dir >/dev/null 2>&1; then
+        ACMEDIR="$TMP/acmecerts"
+        mkdir -p "$ACMEDIR"
+        (
+            export VYTO_PROXY_HOME="$TMP/acmestate"
+            mkdir -p "$VYTO_PROXY_HOME"
+            "$DTP" -d localhost -p $B1 >/dev/null 2>&1
+            # stdbuf: the daemon's stdout is block-buffered into a file, so a
+            # log-based assertion reads an empty file unless it is flushed per
+            # line. The certificate checks below read the filesystem and the
+            # live socket instead, which is why they passed while this did not.
+            stdbuf -oL "$TMP/vyto-proxyd" -p 5002 -v --tls --tls-port 15443 \
+                --certs "$ACMEDIR" --acme \
+                --acme-ca https://127.0.0.1:14000/dir \
+                --acme-ca-file "$TMP/pebble/test/certs/pebble.minica.pem" \
+                --acme-email test@example.com >"$TMP/acmed.log" 2>&1 &
+            echo $! > "$TMP/acmed.pid"
+        )
+        sleep 22
+        ACMED_PID=$(cat "$TMP/acmed.pid" 2>/dev/null)
+
+        if [ -f "$ACMEDIR/localhost.crt" ]; then
+            ok "the daemon obtains a certificate by itself"
+        else
+            bad "the daemon obtains a certificate by itself" "$(grep acme: "$TMP/acmed.log" | tail -1)"
+        fi
+
+        # The proxy answering its own challenge is the whole trick: it is
+        # single-threaded, so the issuance has to keep serving while it waits.
+        case "$(cat "$TMP/acmed.log")" in
+            *"acme challenge"*) ok "the proxy answers its own http-01 challenge" ;;
+            *) bad "the proxy answers its own http-01 challenge" "no challenge was served" ;;
+        esac
+
+        if [ -f "$ACMEDIR/localhost.crt" ]; then
+            ISSUER=$(openssl x509 -in "$ACMEDIR/localhost.crt" -noout -issuer 2>/dev/null)
+            case "$ISSUER" in
+                *Pebble*) ok "the certificate really came from the CA" ;;
+                *) bad "the certificate really came from the CA" "issuer was: $ISSUER" ;;
+            esac
+
+            CPUB=$(openssl x509 -in "$ACMEDIR/localhost.crt" -noout -pubkey 2>/dev/null | openssl md5)
+            KPUB=$(openssl pkey -in "$ACMEDIR/localhost.key" -pubout 2>/dev/null | openssl md5)
+            want "the saved key matches the certificate" "$CPUB" "$KPUB"
+
+            # A certificate nobody serves is not a renewal: the SNI table has to
+            # be rebuilt, or this would need a restart to take effect.
+            SERVED=$(echo | timeout 8 openssl s_client -connect 127.0.0.1:15443 -servername localhost 2>/dev/null \
+                     | openssl x509 -noout -issuer 2>/dev/null)
+            case "$SERVED" in
+                *Pebble*) ok "the new certificate is served without a restart" ;;
+                *) bad "the new certificate is served without a restart" "serving: $SERVED" ;;
+            esac
+        fi
+
+        [ -n "$ACMED_PID" ] && kill "$ACMED_PID" 2>/dev/null
+    else
+        echo "  (pebble did not start; skipping)"
+    fi
+    kill $PEBBLE_PID 2>/dev/null
+else
+    echo "acme (pebble not installed - skipping end-to-end ACME)"
+fi
 
 echo "live reload"
 want "unrouted before add" "$(curl -s -m5 -o /dev/null -w '%{http_code}' -H 'Host: late.local' $H/)" '404'

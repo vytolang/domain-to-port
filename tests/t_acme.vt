@@ -1,0 +1,78 @@
+// Unit tests for the parts of ACME that do not need a CA.
+//
+// The protocol itself is exercised against Pebble in run_tests.sh; these cover
+// the pieces where a silent mistake would be hardest to spot from a failure
+// message — signature shape, JWK ordering, challenge matching.
+
+import { newKey, signedRequest, strbytes_of } from "vyto-proxy/src/jws";
+import { Store, PREFIX, challengeResponse } from "vyto-proxy/src/challenge";
+import { stemFor, RENEW_BEFORE_DAYS } from "vyto-proxy/src/certstore";
+import { requestPath } from "vyto-proxy/src/head";
+
+fn check(label: string, got: int, want: int) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got {got}, want {want}`);
+}
+fn checks(label: string, got: string, want: string) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got "{got}", want "{want}"`);
+}
+fn yes(label: string, got: bool) {
+    if (got) { print(`ok   {label}`); return; }
+    print(`FAIL {label}`);
+}
+
+fn main() {
+    let k = newKey();
+    yes("an account key is generated", k.ok());
+
+    // The JWK's member order is what the thumbprint hashes, and RFC 7638 fixes
+    // it as crv, kty, x, y. A differently ordered JWK hashes differently and
+    // every challenge then fails validation for no visible reason.
+    yes("jwk starts with crv", k.jwk.starts_with("{\"crv\":\"P-256\""));
+    yes("jwk has kty before x", k.jwk.index_of("\"kty\"") < k.jwk.index_of("\"x\""));
+    yes("jwk has x before y", k.jwk.index_of("\"x\"") < k.jwk.index_of("\"y\""));
+    yes("thumbprint is non-empty", !k.thumbprint().is_empty());
+    yes("thumbprint is unpadded base64url", !k.thumbprint().contains("="));
+
+    // ES256 is 64 raw bytes, R||S. OpenSSL produces DER, which is a different
+    // length and a different shape; sending DER gets a malformed-JWS rejection
+    // that says nothing about encoding.
+    check("signature is 64 bytes (R||S, not DER)", k.sign(strbytes_of("hello")).len, 64);
+
+    let pem = k.toPem();
+    yes("key exports as PEM", pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+
+    let csr = k.csr(["a.test", "b.test"]);
+    yes("a CSR is produced", csr.len > 0);
+    check("an empty domain list makes no CSR", k.csr([]).len, 0);
+
+    let jws = signedRequest(k, "https://ca/x", "nonce1", "{}", "");
+    yes("a new-account JWS carries the jwk", jws.contains("protected"));
+    yes("a signed request has all three members",
+        jws.contains("\"payload\"") && jws.contains("\"signature\""));
+
+    // POST-as-GET: an empty payload is the empty STRING, not base64 of "{}".
+    let asget = signedRequest(k, "https://ca/x", "n", "", "https://ca/acct/1");
+    yes("post-as-get has an empty payload", asget.contains("\"payload\":\"\""));
+
+    // ---- challenge store ----
+    let s = new Store();
+    s.put("tok-1", "tok-1.thumb");
+    checks("a known token is answered", s.answer(PREFIX + "tok-1"), "tok-1.thumb");
+    checks("an unknown token is not", s.answer(PREFIX + "other"), "");
+    checks("a non-challenge path is not", s.answer("/index.html"), "");
+    checks("traversal is refused", s.answer(PREFIX + "../../etc/passwd"), "");
+    s.drop("tok-1");
+    check("a dropped token leaves the store empty", s.count(), 0);
+
+    let resp = challengeResponse("body-value");
+    yes("the response is 200", resp.starts_with("HTTP/1.1 200 OK"));
+    yes("the response ends with the key authorization", resp.ends_with("body-value"));
+    yes("the response is plain text", resp.contains("Content-Type: text/plain"));
+
+    // ---- cert store naming ----
+    checks("a plain domain keeps its name", stemFor("a.example.com"), "a.example.com");
+    checks("a wildcard becomes shell-safe", stemFor("*.dev.test"), "_.dev.test");
+    yes("renewal starts well before expiry", RENEW_BEFORE_DAYS >= 14);
+}

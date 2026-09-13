@@ -23,7 +23,10 @@ import { monoMs } from "vyto/util/time";  // monotonic: an idle timeout must not
 import { Table, readTable, normalize } from "vyto-proxy/src/routes";
 import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
 import { writePidFile, removePidFile } from "vyto-proxy/src/signal";
-import { headEnd, hostHeader, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+import { Store, challengeResponse } from "vyto-proxy/src/challenge";
+import { Manager, manager } from "vyto-proxy/src/autocert";
+import { LE_PRODUCTION, LE_STAGING, trustCa } from "vyto-proxy/src/acme";
 import { Tunnel, Buf, BUF_SIZE, PH_HANDSHAKE, PH_READ_HEAD, PH_CONNECTING,
          PH_PIPING, PH_ERROR, PH_CLOSED, IO_WANT_READ, IO_WANT_WRITE,
          IO_ERROR, IO_EOF } from "vyto-proxy/src/tunnel";
@@ -43,6 +46,12 @@ const SWEEP_MS: i64 = 5000;
 // Max connections. Each costs two fds and up to 128k of buffer, so the default
 // is chosen to stay inside a normal 1024-fd ulimit with room to spare.
 const MAX_CONNS: int = 256;
+
+// How often to look for certificates near expiry. Daily: renewal starts at 30
+// days of remaining life, so a check a day leaves thirty chances to succeed
+// before anything expires, and costs one directory read when there is nothing
+// to do.
+const CERT_CHECK_MS: i64 = 86400000;
 
 extern "C" {
     fn vp_ignore_sigpipe();
@@ -71,6 +80,18 @@ export class Proxy {
     // table borrows the SSL_CTXs these own, so this must not be dropped while
     // any connection can still handshake.
     sni: SniSet;
+
+    // Live ACME challenges. Answered by the proxy itself, before any route
+    // lookup, because a certificate is requested for a domain BEFORE anything
+    // is serving it — requiring a route first would be a chicken-and-egg.
+    acme: Store;
+
+    // Automatic certificates, null unless --acme. Checked on a timer rather
+    // than on a schedule kept elsewhere: the expiry lives in the certificate
+    // file, so there is nothing to get out of step.
+    autocert: Manager;
+    last_cert_check: i64;
+    certs_dir: string;      // remembered so certificates can be reloaded
     poll: PollSet;
 
     // Tunnels indexed by fd. Both of a tunnel's fds point at the same object,
@@ -92,6 +113,10 @@ export class Proxy {
         this.tls_listener = null;
         this.tls_ctx = null;
         this.sni = null;
+        this.acme = new Store();
+        this.autocert = null;
+        this.last_cert_check = 0;
+        this.certs_dir = "";
         this.poll = null;
         this.slots = [];
         this.hi_fd = 0;
@@ -152,6 +177,57 @@ export class Proxy {
         return this.poll.add(this.tls_listener, POLL_READ);
     }
 
+    // One pass of the event loop, for up to `ms`.
+    //
+    // Exists so a blocking operation inside the loop — an ACME issuance — can
+    // keep the proxy answering while it waits. It is the loop's body without
+    // the loop: poll, dispatch, sweep, return.
+    // Rebuild the SNI table from the certificate directory.
+    //
+    // The old table is kept until the new one is built and installed: a failure
+    // here must leave the proxy serving what it was serving, not nothing. The
+    // previous SniSet is dropped only after the swap, since the C lookup table
+    // borrows the contexts it owns.
+    fn reloadCerts(): bool {
+        if (this.certs_dir.is_empty() || this.tls_ctx == null) { return false; }
+        let next = load(this.certs_dir);
+        if (!next.ok()) {
+            print(`vyto-proxyd: reloading certificates: {next.err}`);
+            return false;
+        }
+        if (!next.install(this.tls_ctx)) {
+            print("vyto-proxyd: could not install the reloaded certificates");
+            return false;
+        }
+        this.sni = next;
+        this.log(`reloaded {next.count()} certificate(s)`);
+        return true;
+    }
+
+    fn pumpOnce(ms: int) {
+        let lfd = this.listener.fd as int;
+        let tfd = -1;
+        if (this.tls_listener != null) { tfd = this.tls_listener.fd as int; }
+
+        let n = this.poll.wait(ms);
+        let now = monoMs();
+        if (n > 0) {
+            let i = 0;
+            while (i < n) {
+                let fd = this.poll.readyFd(i);
+                let ev = this.poll.readyEvents(i);
+                if (fd == lfd) { this.acceptBurst(this.listener, false, now); }
+                else if (fd == tfd) { this.acceptBurst(this.tls_listener, true, now); }
+                else { this.service(fd, ev, now); }
+                i += 1;
+            }
+        }
+        if (now - this.last_sweep >= SWEEP_MS) {
+            this.sweep(now);
+            this.last_sweep = now;
+        }
+    }
+
     fn run() {
         let lfd = this.listener.fd as int;
         let tfd = -1;
@@ -184,6 +260,23 @@ export class Proxy {
             if (now - this.last_sweep >= SWEEP_MS) {
                 this.sweep(now);
                 this.last_sweep = now;
+            }
+
+            // Certificates are checked on the same tick, far less often.
+            // Renewal is slow (a CA round trip per domain) and blocks the
+            // loop, which is acceptable once a day at 30 days of margin but
+            // would not be if it ran on every sweep.
+            if (this.autocert != null && now - this.last_cert_check >= CERT_CHECK_MS) {
+                this.last_cert_check = now;
+                // renewDue blocks for as long as the CA takes. It is given a
+                // pump (installed in main) so that the challenge requests it is
+                // waiting for still get served — see Client.on_wait.
+                let got = this.autocert.renewDue(this.table);
+                // A certificate nobody serves is not a renewal. The SNI table
+                // is built once at startup, so a newly issued file is invisible
+                // until it is rebuilt — which is what makes this automatic
+                // rather than "automatic, then restart the proxy".
+                if (got > 0) { this.reloadCerts(); }
             }
         }
     }
@@ -297,6 +390,18 @@ export class Proxy {
         // as an unusable domain if anyone pasted it.
         let host = normalize(raw);
         if (host.is_empty()) { this.fail(t, badRequest()); return; }
+
+        // An ACME challenge is answered here, before routing: the CA fetches it
+        // over plain HTTP for a domain that may have no route yet.
+        let path = requestPath(t.head, t.head_len);
+        if (!path.is_empty()) {
+            let ans = this.acme.answer(path);
+            if (!ans.is_empty()) {
+                this.log(`acme challenge {host}{path}`);
+                this.fail(t, challengeResponse(ans));
+                return;
+            }
+        }
 
         let port = this.table.lookup(host);
         if (port == 0) {
@@ -545,6 +650,11 @@ fn main() {
     app.option("cert", "certificate chain, PEM (leaf first)").meta("PATH");
     app.option("key", "private key, PEM").meta("PATH");
     app.option("certs", "directory of per-domain <domain>.crt/.key pairs").meta("DIR");
+    app.flag("acme", "get and renew real certificates automatically (needs port 80 reachable)");
+    app.option("acme-email", "contact address for the CA account").meta("EMAIL");
+    app.option("acme-ca", "ACME directory URL (default: Let's Encrypt production)").meta("URL");
+    app.flag("acme-staging", "use Let's Encrypt staging — do this until it works");
+    app.option("acme-ca-file", "trust an extra CA bundle, for a private or test ACME server").meta("PATH");
     app.flag("verbose", "log every routing decision").short("v");
     app.flag("version", "print the version and exit");
 
@@ -600,6 +710,35 @@ fn main() {
                 exit(1);
             }
             p.sni = set;
+            p.certs_dir = certs_dir;
+        }
+
+        // Automatic certificates. Set up before the listener opens so a
+        // misconfiguration is a startup error rather than a surprise a month
+        // later when the first renewal is due.
+        if (app.on("acme")) {
+            if (certs_dir.is_empty()) {
+                print("vyto-proxyd: --acme needs --certs to say where to keep certificates");
+                exit(1);
+            }
+            let ca = app.get("acme-ca");
+            if (ca.is_empty()) {
+                if (app.on("acme-staging")) { ca = LE_STAGING; } else { ca = LE_PRODUCTION; }
+            }
+            let ca_file = app.get("acme-ca-file");
+            if (!ca_file.is_empty()) { trustCa(ca_file); }
+
+            // Recorded here too: --acme can be used without --certs having
+            // loaded anything (an empty directory on a first run), and the
+            // reload after issuance needs to know where to look.
+            p.certs_dir = certs_dir;
+            p.autocert = manager(certs_dir, ca, app.get("acme-email"), p.acme, app.on("verbose"));
+            // Without this the issuance would block the loop it depends on.
+            p.autocert.pump = (ms) => { p.pumpOnce(ms); };
+            if (!p.autocert.ready()) {
+                print(`vyto-proxyd: acme: {p.autocert.err}`);
+                exit(1);
+            }
         }
 
         let tport = app.getInt("tls-port");
@@ -616,6 +755,7 @@ fn main() {
         if (p.sni != null && p.sni.count() > 0) {
             tls_line = tls_line + `, {p.sni.count()} per-domain certificate(s)`;
         }
+        if (p.autocert != null) { tls_line = tls_line + ", ACME on"; }
     }
 
     if (!writePidFile(pidPath())) {

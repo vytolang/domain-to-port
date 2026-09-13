@@ -1,0 +1,118 @@
+// Issuing and renewing certificates while the proxy is running.
+//
+// The pieces are elsewhere: acme.vt talks the protocol, challenge.vt holds the
+// tokens the proxy serves, certstore.vt owns the files. This is the part that
+// knows the order they go in, and it is small on purpose — the interesting
+// decisions are all in the modules it calls.
+//
+// One rule shapes everything here: a failure must never take the proxy down or
+// leave a domain worse off than before. A renewal that fails leaves the old
+// certificate in place and serving, because a certificate with a fortnight left
+// is worth far more than a correct error message.
+
+import { Client, client, CertResult, Challenge, LE_PRODUCTION, LE_STAGING } from "vyto-proxy/src/acme";
+import { AccountKey, loadOrCreateKey } from "vyto-proxy/src/jws";
+import { Store } from "vyto-proxy/src/challenge";
+import { CertInfo, infoFor, save, RENEW_BEFORE_DAYS } from "vyto-proxy/src/certstore";
+import { Table } from "vyto-proxy/src/routes";
+import { path_join, file_mkdirs } from "vyto/io/file";
+
+export class Manager {
+    dir: string;            // where certificates live (the --certs directory)
+    ca_url: string;
+    email: string;
+    key: AccountKey;
+    store: Store;           // the proxy's live challenge store
+    err: string;
+    verbose: bool;
+
+    // Runs one iteration of the proxy's event loop, for the duration given.
+    // Set by the daemon; without it an issuance inside the loop would block the
+    // very requests it is waiting for. See Client.on_wait.
+    pump: fn(int);
+
+    fn init(dir: string, ca_url: string, email: string, store: Store, verbose: bool) {
+        this.dir = dir;
+        this.ca_url = ca_url;
+        this.email = email;
+        this.store = store;
+        this.verbose = verbose;
+        this.err = "";
+        this.key = null;
+        this.pump = null;
+    }
+
+    fn log(msg: string) { if (this.verbose) { print(msg); } }
+
+    // The account key, loaded once and kept: it identifies the account to the
+    // CA, and a fresh one every run would register a new account each time and
+    // burn through rate limits.
+    fn ready(): bool {
+        if (this.key != null && this.key.ok()) { return true; }
+        if (!file_mkdirs(this.dir)) {
+            this.err = "cannot create " + this.dir;
+            return false;
+        }
+        this.key = loadOrCreateKey(path_join(this.dir, "account.key"));
+        if (!this.key.ok()) { this.err = this.key.err; return false; }
+        return true;
+    }
+
+    // Obtain a certificate for one domain. Returns "" on success.
+    fn issue(domain: string): string {
+        if (!this.ready()) { return this.err; }
+
+        // A wildcard cannot be validated over HTTP-01 — the CA has no single
+        // host to fetch from — so it is refused with the reason rather than
+        // attempted and failed obscurely 30 seconds later.
+        if (domain.starts_with("*.")) {
+            return "a wildcard certificate needs DNS-01, which this does not do yet";
+        }
+
+        let c = client(this.ca_url, this.key);
+        let st = this.store;
+        c.on_challenge = (ch) => {
+            st.put(ch.token, ch.keyauth);
+        };
+        c.on_cleanup = (ch) => { st.drop(ch.token); };
+        c.on_wait = this.pump;
+
+        this.log(`acme: requesting a certificate for {domain}`);
+        let r = c.obtain([domain], this.email);
+        if (!r.ok()) { return r.err; }
+
+        let e = save(this.dir, domain, r.pem, c.cert_key_pem);
+        if (!e.is_empty()) { return e; }
+        this.log(`acme: issued {domain}`);
+        return "";
+    }
+
+    // Check every routed domain and renew what is close to expiry.
+    //
+    // Returns the number renewed. Errors are logged per domain rather than
+    // aborting the sweep: one domain failing validation must not stop the
+    // others from renewing, since they are independent.
+    fn renewDue(t: Table): int {
+        let done = 0;
+        for (let r in t.all()) {
+            if (r.wild) { continue; }
+            let info = infoFor(this.dir, r.domain);
+            if (info.exists() && !info.needsRenewal()) { continue; }
+
+            if (info.exists()) {
+                this.log(`acme: {r.domain} expires in {info.daysLeft()} days, renewing`);
+            } else {
+                this.log(`acme: {r.domain} has no certificate, requesting one`);
+            }
+
+            let e = this.issue(r.domain);
+            if (e.is_empty()) { done += 1; }
+            else { print(`acme: {r.domain}: {e}`); }
+        }
+        return done;
+    }
+}
+
+export fn manager(dir: string, ca_url: string, email: string, store: Store, verbose: bool): Manager {
+    return new Manager(dir, ca_url, email, store, verbose);
+}

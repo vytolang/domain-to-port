@@ -16,7 +16,7 @@ all: $(BINS)
 domain-to-port: src/cli_main.vt src/routes.vt src/paths.vt src/signal.vt src/hosts.vt
 	$(VYTOC) build src/cli_main.vt --modpath $(MODPATH) -o $@
 
-vyto-proxyd: src/proxyd.vt src/tunnel.vt src/head.vt src/errors.vt src/routes.vt src/paths.vt src/signal.vt src/tls.vt src/sni.vt src/native/src/hup_shim.c src/native/src/selfsign_shim.c src/native/src/sni_shim.c
+vyto-proxyd: src/proxyd.vt src/tunnel.vt src/head.vt src/errors.vt src/routes.vt src/paths.vt src/signal.vt src/tls.vt src/sni.vt src/acme.vt src/jws.vt src/challenge.vt src/certstore.vt src/autocert.vt src/native/src/hup_shim.c src/native/src/selfsign_shim.c src/native/src/sni_shim.c src/native/src/acme_shim.c
 	$(VYTOC) build src/proxyd.vt --modpath $(MODPATH) -o $@
 
 release: clean-cache

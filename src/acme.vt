@@ -1,0 +1,420 @@
+// ACME: getting a real certificate from a real CA.
+//
+// The protocol is a sequence of POSTs, each a JWS signed by the account key
+// (src/jws.vt), each consuming a single-use nonce that arrived in the previous
+// response's header. The shape:
+//
+//   1. GET  /directory            -> the URLs for everything below
+//   2. HEAD /new-nonce            -> the first nonce
+//   3. POST /new-account          -> account URL, used as `kid` from here on
+//   4. POST /new-order            -> an order with one authorization per name
+//   5. POST authz URL             -> the challenges offered for that name
+//   6. serve the HTTP-01 token, then POST the challenge URL to say "ready"
+//   7. poll the order until it is `ready`
+//   8. POST /finalize with a CSR -> poll until `valid`
+//   9. POST the certificate URL  -> the PEM chain
+//
+// HTTP-01 is the challenge used here: the CA fetches
+// http://<domain>/.well-known/acme-challenge/<token> and expects
+// "<token>.<thumbprint>". The proxy is already listening on that port, so it
+// answers the challenge itself — no webroot to configure, nothing else to run.
+//
+// Every failure returns a reason rather than a bool. An ACME failure is
+// diagnosable (bad nonce, unauthorized, rate limited, DNS wrong) and "false"
+// helps nobody at 3am.
+
+import { http_get, http_post, http_request, http_set_ca_file, Response } from "vyto/net/http";
+import { json_parse, JsonValue } from "vyto/util/json";
+import { base64url_encode } from "vyto/util/mime";
+import { AccountKey, newKey, signedRequest, strbytes_of } from "vyto-proxy/src/jws";
+import { sleepMs } from "vyto/util/time";
+
+// Let's Encrypt. Staging first while you are getting it working — production
+// has rate limits that lock you out for a week, and a staging certificate
+// proves the whole flow without spending that budget.
+export const LE_PRODUCTION: string = "https://acme-v02.api.letsencrypt.org/directory";
+export const LE_STAGING: string = "https://acme-staging-v02.api.letsencrypt.org/directory";
+
+// How long to keep polling a pending authorization or order.
+const POLL_TRIES: int = 30;
+const POLL_MS: int = 1000;
+
+// One challenge the proxy must answer: the path a CA will fetch, and what to
+// return from it.
+export class Challenge {
+    domain: string;
+    token: string;          // the URL's last segment
+    keyauth: string;        // "<token>.<thumbprint>", the body to serve
+    url: string;            // where to POST "I am ready"
+
+    fn init(domain: string, token: string, keyauth: string, url: string) {
+        this.domain = domain;
+        this.token = token;
+        this.keyauth = keyauth;
+        this.url = url;
+    }
+}
+
+// The outcome of an issuance attempt.
+export class CertResult {
+    pem: string;            // the full chain, leaf first
+    err: string;
+
+    fn init(pem: string, err: string) { this.pem = pem; this.err = err; }
+    fn ok(): bool { return this.err.is_empty() && !this.pem.is_empty(); }
+}
+
+// A conversation with one CA.
+//
+// Holds the directory, the account URL and the current nonce — all three are
+// per-conversation state, and the nonce especially: it changes on every
+// request and reusing one is an immediate rejection.
+export class Client {
+    dir_url: string;
+    key: AccountKey;
+
+    new_nonce: string;
+    new_account: string;
+    new_order: string;
+    nonce: string;
+    kid: string;            // the account URL, once registered
+    err: string;
+
+    // The private key for the certificate just issued, PEM. Written by
+    // finalize(); the caller needs it to serve the certificate at all, since
+    // the CA only ever sees the public half.
+    cert_key_pem: string;
+
+    // What to do when a challenge is ready to be served. The daemon installs a
+    // handler that makes the token reachable; issuance cannot proceed until it
+    // returns, because the CA fetches immediately after.
+    on_challenge: fn(Challenge);
+    on_cleanup: fn(Challenge);
+
+    // Called instead of sleeping while waiting on the CA.
+    //
+    // This is the difference between working and deadlocking. Vyto has no
+    // threads, so an issuance running inside the proxy's event loop blocks it —
+    // and the thing the CA is waiting for is a request TO that loop. Sleeping
+    // here means the challenge can never be answered and validation always
+    // times out. The daemon passes a function that runs one poll iteration, so
+    // the wait doubles as service.
+    //
+    // Left null by a caller with its own thread of control (a CLI run), which
+    // then simply sleeps.
+    on_wait: fn(int);
+
+    fn init(dir_url: string, key: AccountKey) {
+        this.dir_url = dir_url;
+        this.key = key;
+        this.new_nonce = "";
+        this.new_account = "";
+        this.new_order = "";
+        this.nonce = "";
+        this.kid = "";
+        this.err = "";
+        this.cert_key_pem = "";
+        this.on_challenge = null;
+        this.on_cleanup = null;
+        this.on_wait = null;
+    }
+
+    fn ok(): bool { return this.err.is_empty(); }
+
+    fn fail(msg: string): bool {
+        this.err = msg;
+        return false;
+    }
+
+    // ---- transport ----
+
+    // A signed POST. Every ACME request except the directory and new-nonce is
+    // one of these.
+    fn post(url: string, payload: string): Response {
+        // One retry, for the one recoverable error in the protocol.
+        //
+        // A nonce is single-use and the server decides when one expires, so
+        // badNonce is not a bug to prevent but a condition to handle: RFC 8555
+        // says a client MUST retry with the fresh nonce the rejection carries.
+        // Without this a long issuance fails partway through for no reason the
+        // user can act on.
+        let attempt = 0;
+        while (attempt < 2) {
+            if (this.nonce.is_empty() && !this.refreshNonce()) { return null; }
+
+            let body = signedRequest(this.key, url, this.nonce, payload, this.kid);
+            if (body.is_empty()) { this.fail("could not sign the request"); return null; }
+
+            // Spent whether or not the request succeeds.
+            this.nonce = "";
+
+            let res = http_post(url)
+                .header("Content-Type", "application/jose+json")
+                .body(body)
+                .send();
+            if (res == null) { this.fail("no response from " + url); return null; }
+
+            // Every response may carry the next nonce, including a rejection.
+            let n = res.header("replay-nonce");
+            if (!n.is_empty()) { this.nonce = n; }
+
+            if (attempt == 0 && isBadNonce(res)) { attempt += 1; continue; }
+            return res;
+        }
+        this.fail("the CA kept rejecting the nonce");
+        return null;
+    }
+
+    fn refreshNonce(): bool {
+        if (this.new_nonce.is_empty() && !this.directory()) { return false; }
+        let res = http_request("HEAD", this.new_nonce).send();
+        if (res == null) { return this.fail("could not reach " + this.new_nonce); }
+        this.nonce = res.header("replay-nonce");
+        if (this.nonce.is_empty()) { return this.fail("the CA sent no nonce"); }
+        return true;
+    }
+
+    // ---- protocol ----
+
+    fn directory(): bool {
+        if (!this.new_order.is_empty()) { return true; }
+        let res = http_get(this.dir_url).send();
+        if (res == null) { return this.fail("could not reach " + this.dir_url); }
+        if (!res.ok()) { return this.fail(`the CA directory returned {res.status()}`); }
+
+        let d = res.json();
+        this.new_nonce = d.get("newNonce").asString();
+        this.new_account = d.get("newAccount").asString();
+        this.new_order = d.get("newOrder").asString();
+        if (this.new_order.is_empty() || this.new_account.is_empty()) {
+            return this.fail("the CA directory is missing newOrder or newAccount");
+        }
+        return true;
+    }
+
+    // Register, or recover the URL of an existing account for this key.
+    //
+    // onlyReturnExisting is deliberately NOT set: the same call registers a new
+    // account and returns an existing one, so there is no separate "have I
+    // registered?" state to keep in sync with the CA.
+    fn account(email: string): bool {
+        if (!this.kid.is_empty()) { return true; }
+        if (!this.directory()) { return false; }
+
+        let payload = "{\"termsOfServiceAgreed\":true";
+        if (!email.is_empty()) {
+            payload = payload + ",\"contact\":[\"mailto:" + email + "\"]";
+        }
+        payload = payload + "}";
+
+        let res = this.post(this.new_account, payload);
+        if (res == null) { return false; }
+        if (res.status() != 200 && res.status() != 201) {
+            return this.fail("account registration failed: " + problem(res));
+        }
+        this.kid = res.header("location");
+        if (this.kid.is_empty()) { return this.fail("the CA returned no account URL"); }
+        return true;
+    }
+
+    // The whole issuance, for one set of names.
+    fn obtain(domains: string[], email: string): CertResult {
+        if (domains.len == 0) { return new CertResult("", "no domains"); }
+        if (!this.key.ok()) { return new CertResult("", this.key.err); }
+        if (!this.account(email)) { return new CertResult("", this.err); }
+
+        // 1. Order.
+        let idents = "";
+        for (let d in domains) {
+            if (!idents.is_empty()) { idents = idents + ","; }
+            idents = idents + "{\"type\":\"dns\",\"value\":\"" + d + "\"}";
+        }
+        let res = this.post(this.new_order, "{\"identifiers\":[" + idents + "]}");
+        if (res == null) { return new CertResult("", this.err); }
+        if (res.status() != 201) {
+            return new CertResult("", "the CA refused the order: " + problem(res));
+        }
+        let order_url = res.header("location");
+        let order = res.json();
+        // Kept from THIS response: a later POST-as-GET of the order is a fresh
+        // representation, and relying on it to still carry `finalize` made the
+        // flow depend on a field the server is not obliged to repeat.
+        let finalize_url = order.get("finalize").asString();
+        if (finalize_url.is_empty()) {
+            return new CertResult("", "the order has no finalize URL");
+        }
+
+        // 2. Every authorization, one per name.
+        let authzs = order.get("authorizations");
+        let served: Challenge[] = [];
+        let i = 0;
+        while (i < authzs.len()) {
+            let ch = this.solve(authzs.at(i).asString());
+            if (ch == null) { this.cleanup(served); return new CertResult("", this.err); }
+            // A null challenge with no error means it was already valid.
+            if (!ch.token.is_empty()) { served.push(ch); }
+            i += 1;
+        }
+
+        // 3. Wait for the CA to check them.
+        if (!this.await_ready(order_url)) {
+            this.cleanup(served);
+            return new CertResult("", this.err);
+        }
+        this.cleanup(served);
+
+        // 4. Finalize with a CSR, then collect the certificate.
+        return this.finalize(order_url, finalize_url, domains);
+    }
+
+    // Fetch one authorization, answer its HTTP-01 challenge.
+    //
+    // Returns a Challenge with an empty token when the authorization is already
+    // valid — a CA remembers a recent validation, and re-answering one that was
+    // never asked for would fail.
+    fn solve(authz_url: string): Challenge {
+        let res = this.post(authz_url, "");
+        if (res == null) { return null; }
+        if (!res.ok()) { this.fail("could not read an authorization: " + problem(res)); return null; }
+
+        let a = res.json();
+        let domain = a.get("identifier").get("value").asString();
+        let status = a.get("status").asString();
+        if (status == "valid") { return new Challenge(domain, "", "", ""); }
+
+        let chs = a.get("challenges");
+        let j = 0;
+        while (j < chs.len()) {
+            let c = chs.at(j);
+            if (c.get("type").asString() == "http-01") {
+                let token = c.get("token").asString();
+                let url = c.get("url").asString();
+                if (token.is_empty() || url.is_empty()) {
+                    this.fail("the CA sent a malformed http-01 challenge");
+                    return null;
+                }
+                let ch = new Challenge(domain, token,
+                                       token + "." + this.key.thumbprint(), url);
+
+                // Make it answerable BEFORE telling the CA to look: validation
+                // often starts within milliseconds of the POST below.
+                if (this.on_challenge != null) { this.on_challenge(ch); }
+
+                let r2 = this.post(url, "{}");
+                if (r2 == null) { return null; }
+                if (!r2.ok()) {
+                    this.fail("the CA rejected the challenge response: " + problem(r2));
+                    return null;
+                }
+                return ch;
+            }
+            j += 1;
+        }
+        this.fail(`the CA offered no http-01 challenge for {domain}`);
+        return null;
+    }
+
+    fn cleanup(served: Challenge[]) {
+        if (this.on_cleanup == null) { return; }
+        for (let c in served) { this.on_cleanup(c); }
+    }
+
+    // Poll the order until the CA has finished validating.
+    // Wait one poll interval, serving the proxy's own sockets if we were given
+    // a way to.
+    fn wait() {
+        if (this.on_wait != null) { this.on_wait(POLL_MS); return; }
+        sleepMs(POLL_MS);
+    }
+
+    fn await_ready(order_url: string): bool {
+        let tries = 0;
+        while (tries < POLL_TRIES) {
+            let res = this.post(order_url, "");
+            if (res == null) { return false; }
+            if (!res.ok()) { return this.fail("could not read the order: " + problem(res)); }
+            let s = res.json().get("status").asString();
+            if (s == "ready" || s == "valid") { return true; }
+            if (s == "invalid") {
+                return this.fail("the CA could not validate the domain — is it "
+                               + "reachable from the internet on port 80?");
+            }
+            this.wait();
+            tries += 1;
+        }
+        return this.fail("the CA did not finish validating in time");
+    }
+
+    // The CERTIFICATE key, generated fresh for this order.
+    //
+    // It must not be the account key: a CA rejects a CSR whose public key is
+    // one it already knows as an account ("CSR contains a public key for a
+    // known account"), and rightly — the account key authenticates you to the
+    // CA, and reusing it as a TLS server key would hand that authority to
+    // anything that could read the server's key file.
+    fn finalize(order_url: string, fin: string, domains: string[]): CertResult {
+        let certkey = newKey();
+        if (!certkey.ok()) { return new CertResult("", "could not generate a certificate key"); }
+        this.cert_key_pem = certkey.toPem();
+
+        let csr = certkey.csr(domains);
+        if (csr.len == 0) { return new CertResult("", "could not build a CSR"); }
+
+        let r2 = this.post(fin, "{\"csr\":\"" + base64url_encode(csr) + "\"}");
+        if (r2 == null) { return new CertResult("", this.err); }
+        if (!r2.ok()) { return new CertResult("", "finalize failed: " + problem(r2)); }
+
+        // Poll for the certificate URL.
+        let tries = 0;
+        while (tries < POLL_TRIES) {
+            let r3 = this.post(order_url, "");
+            if (r3 == null) { return new CertResult("", this.err); }
+            let o = r3.json();
+            let st = o.get("status").asString();
+            if (st == "valid") {
+                let cert_url = o.get("certificate").asString();
+                if (cert_url.is_empty()) {
+                    return new CertResult("", "the order is valid but names no certificate");
+                }
+                let r4 = this.post(cert_url, "");
+                if (r4 == null) { return new CertResult("", this.err); }
+                if (!r4.ok()) { return new CertResult("", "could not download the certificate"); }
+                return new CertResult(r4.text(), "");
+            }
+            if (st == "invalid") { return new CertResult("", "the CA rejected the order after finalize"); }
+            this.wait();
+            tries += 1;
+        }
+        return new CertResult("", "the certificate was not issued in time");
+    }
+}
+
+// Did the CA reject this specifically for a stale nonce?
+fn isBadNonce(res: Response): bool {
+    if (res.status() != 400) { return false; }
+    return res.json().get("type").asString().contains("badNonce");
+}
+
+// ACME errors are RFC 7807 problem documents. Their `detail` is written for a
+// human and is far more use than the status code.
+fn problem(res: Response): string {
+    let j = res.json();
+    let d = j.get("detail").asString();
+    if (!d.is_empty()) { return d; }
+    let t = j.get("type").asString();
+    if (!t.is_empty()) { return t; }
+    return `HTTP {res.status()}`;
+}
+
+// Talking to a CA whose certificate is not publicly trusted -- a local test
+// server such as Pebble -- is done by pointing $CURL_CA_BUNDLE at its CA, not
+// by a flag here. There is deliberately no way to switch verification off: an
+// ACME client that can be told to skip it is one misconfiguration away from
+// accepting a certificate from anybody.
+export fn client(dir_url: string, key: AccountKey): Client {
+    return new Client(dir_url, key);
+}
+
+// Trust a CA bundle that is not in the system store, for talking to a private
+// or test ACME server. Process-wide, and it only ever ADDS trust.
+export fn trustCa(path: string) { http_set_ca_file(path); }

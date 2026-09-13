@@ -1,0 +1,176 @@
+// The account key, and the JWS envelope every ACME request travels in.
+//
+// ACME does not use bearer tokens. Every POST is a JWS signed by the account
+// key, and the server replays the protected header back into its own checks, so
+// a field that is subtly wrong fails with "malformed JWS" and no hint as to
+// which field. The three that actually bite are all here:
+//
+//   - the signature is R||S, 64 raw bytes, NOT the DER OpenSSL produces
+//   - the JWK's members must be in RFC 7638 order for the thumbprint to match
+//   - `nonce` is single-use and arrives in a response header, so it has to be
+//     threaded through every call rather than fetched once
+//
+// Everything is base64url without padding. A single '=' anywhere is a reject.
+
+#link "ssl" if "linux"
+#link "crypto" if "linux"
+
+import { base64url_encode } from "vyto/util/mime";
+import { sha256 } from "vyto/crypto";
+import { file_exists } from "vyto/io/file";
+
+extern "C" {
+    fn vp_acme_genkey(): rawptr;
+    fn vp_acme_key_from_pem(pem: cstring): rawptr;
+    fn vp_acme_key_to_pem(k: rawptr, out: cstring, cap: i32): i32;
+    fn vp_acme_jwk(k: rawptr, out: cstring, cap: i32): i32;
+    fn vp_acme_sign(k: rawptr, data: rawptr, len: i32, out: rawptr, cap: i32): i32;
+    fn vp_acme_csr(k: rawptr, names: cstring, out: rawptr, cap: i32): i32;
+    fn vp_acme_key_free(k: rawptr);
+}
+
+const PEM_CAP: int = 4096;
+const JWK_CAP: int = 512;
+const SIG_LEN: int = 64;        // P-256: two 32-byte halves
+const CSR_CAP: int = 8192;
+
+// An ECDSA P-256 key, plus the JWK that identifies it to the server.
+export class AccountKey {
+    handle: rawptr;
+    jwk: string;        // compact, RFC 7638 member order
+    err: string;
+
+    fn init(handle: rawptr) {
+        this.handle = handle;
+        this.jwk = "";
+        this.err = "";
+        if (handle == null) { this.err = "no account key"; return; }
+        let buf = bytes(JWK_CAP);
+        if ((vp_acme_jwk(handle, buf as cstring, JWK_CAP as i32) as int) != 1) {
+            this.err = "could not read the key's public part";
+            return;
+        }
+        this.jwk = str(buf as cstring);
+    }
+
+    fn ok(): bool { return this.handle != null && this.err.is_empty(); }
+
+    // The key's thumbprint: base64url(SHA-256(compact JWK)).
+    //
+    // This is half of every challenge response, so it is derived from the same
+    // JWK string that gets signed rather than from a second serialisation that
+    // could disagree with it.
+    fn thumbprint(): string {
+        return base64url_encode(sha256(strbytes_of(this.jwk)));
+    }
+
+    fn toPem(): string {
+        if (this.handle == null) { return ""; }
+        let buf = bytes(PEM_CAP);
+        if ((vp_acme_key_to_pem(this.handle, buf as cstring, PEM_CAP as i32) as int) != 1) {
+            return "";
+        }
+        return str(buf as cstring);
+    }
+
+    // Sign, returning the 64-byte R||S form JWS wants.
+    fn sign(data: byte[]): byte[] {
+        if (this.handle == null) { return bytes(0); }
+        let out = bytes(SIG_LEN);
+        let r = vp_acme_sign(this.handle, data as rawptr, data.len as i32,
+                             out as rawptr, SIG_LEN as i32) as int;
+        if (r != 1) { return bytes(0); }
+        return out;
+    }
+
+    // A DER CSR covering `names`, the certificate request itself.
+    fn csr(names: string[]): byte[] {
+        if (this.handle == null || names.len == 0) { return bytes(0); }
+        let list = "";
+        for (let n in names) {
+            if (!list.is_empty()) { list = list + ","; }
+            list = list + n;
+        }
+        let buf = bytes(CSR_CAP);
+        let n = vp_acme_csr(this.handle, list.cstr(), buf as rawptr, CSR_CAP as i32) as int;
+        if (n <= 0) { return bytes(0); }
+        let out = bytes(n);
+        let i = 0;
+        while (i < n) { out[i] = buf[i]; i += 1; }
+        return out;
+    }
+
+    deinit { if (this.handle != null) { vp_acme_key_free(this.handle); this.handle = null; } }
+}
+
+export fn newKey(): AccountKey { return new AccountKey(vp_acme_genkey()); }
+
+// Load the account key, generating and saving one on first use.
+//
+// The same key must be reused across runs: it IS the account as far as the CA
+// is concerned, and a new key is a new account with its own rate-limit budget
+// and no memory of previous authorizations.
+export fn loadOrCreateKey(path: string): AccountKey {
+    if (file_exists(path)) {
+        let k = new AccountKey(vp_acme_key_from_pem(readfile(path).cstr()));
+        if (k.ok()) { return k; }
+        // A key file that cannot be read is not replaced silently: doing so
+        // would abandon the existing account without saying anything.
+        let bad = new AccountKey(null);
+        bad.err = path + " is not a usable account key";
+        return bad;
+    }
+    let k = newKey();
+    if (!k.ok()) { return k; }
+    let pem = k.toPem();
+    if (pem.is_empty() || !writefile(path, pem)) {
+        k.err = "could not save the account key to " + path;
+    }
+    return k;
+}
+
+// ---- JWS ------------------------------------------------------------------
+
+// Bytes of a string, without the NUL a cstring conversion would imply.
+export fn strbytes_of(s: string): byte[] {
+    let out = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { out[i] = s[i] as byte; i += 1; }
+    return out;
+}
+
+fn b64u(s: string): string { return base64url_encode(strbytes_of(s)); }
+
+// Build a flattened JWS.
+//
+// `kid` is the account URL once registered; before that the header must carry
+// the full `jwk` instead. Sending both, or the wrong one for the request, is
+// rejected — newAccount wants jwk, everything after it wants kid.
+export fn signedRequest(key: AccountKey, url: string, nonce: string,
+                        payload: string, kid: string): string {
+    let alg = "\"alg\":\"ES256\"";
+    let ident = "";
+    if (kid.is_empty()) { ident = "\"jwk\":" + key.jwk; }
+    else { ident = "\"kid\":\"" + kid + "\""; }
+
+    // Built by concatenation: a template literal would need every JSON brace
+    // doubled, which makes the shape of the header harder to read than the
+    // quoting saves.
+    let protected_json = "{" + alg + "," + ident
+                       + ",\"nonce\":\"" + nonce + "\""
+                       + ",\"url\":\"" + url + "\"}";
+    let p64 = b64u(protected_json);
+
+    // A POST-as-GET carries an empty payload, which is the empty STRING, not
+    // base64url of "{}" — a distinction the spec makes and servers enforce.
+    let pay64 = "";
+    if (!payload.is_empty()) { pay64 = b64u(payload); }
+
+    let signing_input = p64 + "." + pay64;
+    let sig = key.sign(strbytes_of(signing_input));
+    if (sig.len == 0) { return ""; }
+    let s64 = base64url_encode(sig);
+
+    return "{\"protected\":\"" + p64 + "\",\"payload\":\"" + pay64
+         + "\",\"signature\":\"" + s64 + "\"}";
+}
