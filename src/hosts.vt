@@ -48,6 +48,17 @@ export fn hostsPath(): string {
 
 fn needsSudo(): bool { return getenv("VYTO_PROXY_HOSTS").is_empty(); }
 
+// Is there a terminal to prompt on?
+//
+// `sudo` with no tty and no cached credential cannot ask for a password, so it
+// fails in a way that looks identical to being refused. Knowing which happened
+// is the difference between a message the user can act on and one that reads
+// like the tool is broken.
+extern "C" {
+    fn isatty(fd: i32): i32;
+}
+fn hasTty(): bool { return (isatty(0 as i32) as int) == 1; }
+
 // True when `p` is safe to place on a shell command line.
 //
 // An allow-list, following src/vytopack/safety.vt in the voltlang tree:
@@ -255,6 +266,12 @@ export fn sync(wanted: string[], dry: bool): HostsResult {
         res.err = target + " does not exist";
         return res;
     }
+    // file_exists() is true for a directory, and readfile() panics on one. A
+    // mistyped VYTO_PROXY_HOSTS should be an error message, not a stack trace.
+    if (isdir(target)) {
+        res.err = target + " is a directory, not a file";
+        return res;
+    }
 
     let current = readfile(target);
     if (current.is_empty()) {
@@ -336,7 +353,18 @@ export fn sync(wanted: string[], dry: bool): HostsResult {
         let rc = run("sudo install -m 0644 -o root -g root " + tmp + " " + target);
         if (rc != 0) {
             file_remove(tmp);
-            res.err = "could not update " + target;
+            // Distinguish "sudo could not ask" from "sudo was refused". The
+            // first happens whenever this runs without a terminal — a script, a
+            // CI step, a command substitution — and reads like a bug in the
+            // tool unless it is named. The second is the user declining, which
+            // is a perfectly good answer and should not look like a failure of
+            // machinery.
+            if (!hasTty()) {
+                res.err = target + " needs root, and sudo has no terminal to ask for a password on"
+                        + " (run it from a shell, or use sudo -v first)";
+            } else {
+                res.err = "sudo declined; " + target + " is unchanged";
+            }
             return res;
         }
     }

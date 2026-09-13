@@ -393,6 +393,32 @@ if diff -q "$TMP/iso-hosts.orig" "$TMP/iso-hosts" >/dev/null 2>&1; then
 else
     bad "removing every route restores the file byte-for-byte" "$(diff "$TMP/iso-hosts.orig" "$TMP/iso-hosts" | head -3)"
 fi
+
+# A hosts failure must be visible to a script, not just to a reader. The route
+# table is written first on purpose -- it is the source of truth, and a hosts
+# problem should not undo a route edit -- so the exit status is the only thing
+# that tells a caller the two ended up out of step.
+#
+# Driven by pointing the override at a path that cannot be written: a directory.
+# That exercises the failure branch without needing sudo or a tty.
+(
+    export VYTO_PROXY_HOME="$TMP/failstate"
+    mkdir -p "$TMP/failstate" "$TMP/adir"
+    export VYTO_PROXY_HOSTS="$TMP/adir"
+    "$DTP" -d fail.test -p 1236 --hosts >"$TMP/hf.log" 2>&1
+    echo $? > "$TMP/hf.code"
+)
+# 101 is a Vyto panic. readfile() aborts on a directory and file_exists() is
+# true for one, so a mistyped path used to crash rather than report.
+want "a hosts failure exits non-zero (not a panic)" "$(cat "$TMP/hf.code")" '1'
+case "$(cat "$TMP/hf.log")" in
+    *"is a directory, not a file"*) ok "a directory as the hosts file is reported" ;;
+    *) bad "a directory as the hosts file is reported" "said: $(grep hosts: "$TMP/hf.log" | head -1)" ;;
+esac
+case "$(cat "$TMP/hf.log")" in
+    *"out of step"*) ok "a hosts failure says the two are out of step" ;;
+    *) bad "a hosts failure says the two are out of step" "said: $(grep hosts: "$TMP/hf.log" | head -1)" ;;
+esac
 unset VYTO_PROXY_HOSTS
 
 echo "live reload"

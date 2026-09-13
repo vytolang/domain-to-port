@@ -95,7 +95,7 @@ fn doAdd(t: Table, path: string, domain: string, port: int, hosts: bool, dry: bo
     else if (had != 0) { print(`{domain} -> :{port} (was :{had})`); }
     else { print(`{domain} -> :{port}`); }
     reportReload();
-    if (hosts) { syncHosts(t, dry); }
+    if (hosts && !syncHosts(t, dry)) { exit(1); }
 }
 
 fn doRemove(t: Table, path: string, domain: string, hosts: bool, dry: bool) {
@@ -109,7 +109,7 @@ fn doRemove(t: Table, path: string, domain: string, hosts: bool, dry: bool) {
     }
     print(`removed {domain}`);
     reportReload();
-    if (hosts) { syncHosts(t, dry); }
+    if (hosts && !syncHosts(t, dry)) { exit(1); }
 }
 
 
@@ -118,7 +118,7 @@ fn doRemove(t: Table, path: string, domain: string, hosts: bool, dry: bool) {
 // Wildcards are skipped: /etc/hosts matches literal names only, so an entry for
 // "*.dev.local" would sit there looking like it worked while resolving nothing.
 // Saying so is better than writing a line that cannot help.
-fn syncHosts(t: Table, dry: bool) {
+fn syncHosts(t: Table, dry: bool): bool {
     let wanted: string[] = [];
     let wilds = 0;
     for (let r in t.all()) {
@@ -129,7 +129,21 @@ fn syncHosts(t: Table, dry: bool) {
     let res = sync(wanted, dry);
     if (!res.ok()) {
         print(`  hosts: {res.err}`);
-        return;
+        // The route table has already been written at this point, on purpose:
+        // it is the source of truth and a hosts failure should not undo a route
+        // edit the user asked for. But the two are now out of step, and a
+        // script that only checks the exit status would otherwise be told this
+        // worked.
+        print(`  hosts: the route table and {hostsPath()} are now out of step`);
+        // Only suggest sudo when sudo was actually the problem. Telling someone
+        // to re-run "once sudo can ask" because they mistyped a path is advice
+        // that sends them looking in the wrong place.
+        if (res.needs_root) {
+            print("         re-run with --hosts once sudo can ask, to reconcile them");
+        } else {
+            print("         fix the problem above and re-run with --hosts to reconcile them");
+        }
+        return false;
     }
     if (!res.changed()) {
         print(`  hosts: already up to date`);
@@ -150,6 +164,7 @@ fn syncHosts(t: Table, dry: bool) {
         print(`  hosts: {wilds} wildcard route(s) skipped — /etc/hosts cannot match a wildcard`);
         print("         point those names at 127.0.0.1 with a local DNS resolver, or list them individually");
     }
+    return true;
 }
 
 fn listTable(t: Table, path: string) {

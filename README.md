@@ -107,6 +107,12 @@ the tools you would use to fix it.
 changes. The daemon never needs root for this; nothing here runs privileged for
 longer than one `install` command.
 
+If the hosts update fails — sudo declined, or no terminal to ask for a password
+on, which is what happens in a script — the command exits non-zero and says so.
+The route itself is still written, because the route table is the source of
+truth and a hosts problem should not undo an edit you asked for; re-run with
+`--hosts` to reconcile the two.
+
 **Wildcards are skipped.** `/etc/hosts` matches literal names only, so a route
 like `*.dev.local` gets a warning rather than a line that could never match.
 For wildcards you need a real resolver — dnsmasq with
@@ -250,7 +256,7 @@ capped at 16 KB.
 make test
 ```
 
-115 checks: unit tests for the table, the header parser and the hosts-file
+118 checks: unit tests for the table, the header parser and the hosts-file
 rewriter, then end-to-end
 runs against real backends on loopback — routing, wildcards, keep-alive, a
 3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live
