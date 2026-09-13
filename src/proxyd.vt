@@ -29,6 +29,7 @@ import { Tunnel, Buf, BUF_SIZE, PH_HANDSHAKE, PH_READ_HEAD, PH_CONNECTING,
          IO_ERROR, IO_EOF } from "vyto-proxy/src/tunnel";
 import { TlsContext, tls_accept, OSSL_WANT_READ, OSSL_WANT_WRITE } from "vyto/crypto/openssl";
 import { CertSource, acquire, CERT_SELF, CERT_FILES } from "vyto-proxy/src/tls";
+import { SniSet, load } from "vyto-proxy/src/sni";
 import { badGateway, noRoute, badRequest } from "vyto-proxy/src/errors";
 
 export const VERSION: string = "0.1.0";
@@ -65,7 +66,11 @@ export class Proxy {
     routes_file: string;
     listener: Socket;       // plain HTTP
     tls_listener: Socket;   // TLS, null unless --tls
-    tls_ctx: TlsContext;    // the server certificate, null unless --tls
+    tls_ctx: TlsContext;    // the base server certificate, null unless --tls
+    // Per-domain certificates. Held here for the process's life: the C lookup
+    // table borrows the SSL_CTXs these own, so this must not be dropped while
+    // any connection can still handshake.
+    sni: SniSet;
     poll: PollSet;
 
     // Tunnels indexed by fd. Both of a tunnel's fds point at the same object,
@@ -86,6 +91,7 @@ export class Proxy {
         this.listener = null;
         this.tls_listener = null;
         this.tls_ctx = null;
+        this.sni = null;
         this.poll = null;
         this.slots = [];
         this.hi_fd = 0;
@@ -507,6 +513,7 @@ fn main() {
     app.intOption("tls-port", "port for TLS").meta("PORT").dfltInt(443);
     app.option("cert", "certificate chain, PEM (leaf first)").meta("PATH");
     app.option("key", "private key, PEM").meta("PATH");
+    app.option("certs", "directory of per-domain <domain>.crt/.key pairs").meta("DIR");
     app.flag("verbose", "log every routing decision").short("v");
     app.flag("version", "print the version and exit");
 
@@ -550,6 +557,23 @@ fn main() {
             print(`vyto-proxyd: TLS: {src.err}`);
             exit(1);
         }
+        // Per-domain certificates, if a directory was given. Loaded before the
+        // listener opens so a bad pair is a startup error, not a handshake that
+        // fails for one domain once someone visits it.
+        let certs_dir = app.get("certs");
+        if (!certs_dir.is_empty()) {
+            let set = load(certs_dir);
+            if (!set.ok()) {
+                print(`vyto-proxyd: {certs_dir}: {set.err}`);
+                exit(1);
+            }
+            if (!set.install(src.ctx)) {
+                print("vyto-proxyd: could not install the SNI table");
+                exit(1);
+            }
+            p.sni = set;
+        }
+
         let tport = app.getInt("tls-port");
         if (!p.listenTls(host, tport, 512, src.ctx)) {
             print(`vyto-proxyd: cannot listen on {host}:{tport}`);
@@ -563,6 +587,9 @@ fn main() {
             tls_line = `TLS on {host}:{tport} with a SELF-SIGNED certificate — browsers will warn`;
         } else {
             tls_line = `TLS on {host}:{tport}`;
+        }
+        if (p.sni != null && p.sni.count() > 0) {
+            tls_line = tls_line + `, {p.sni.count()} per-domain certificate(s)`;
         }
     }
 

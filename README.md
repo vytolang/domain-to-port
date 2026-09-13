@@ -9,7 +9,7 @@ domain-to-port -d www.example.com -p 8099
 That is the whole interface. The route is live before the command returns — no
 restart, no config reload dance, no dropped connections.
 
-A 184 KB daemon that links libc and OpenSSL, and nothing else. It is a reverse
+A 194 KB daemon that links libc and OpenSSL, and nothing else. It is a reverse
 proxy with the parts you actually use on a dev machine and none of the parts
 you don't.
 
@@ -60,8 +60,8 @@ For local development you also need the name to resolve. One line in
 - **Passes anything through.** Once a connection is routed it is a byte pipe,
   so WebSocket upgrades, streaming responses, uploads and HTTP methods this
   proxy has never heard of all work without it understanding them.
-- **Terminates TLS** with `--tls`, and generates its own certificate if you
-  have none.
+- **Terminates TLS** with `--tls`, generates its own certificate if you have
+  none, and serves a per-domain certificate via SNI when you do.
 
 Measured on the test suite: a 3 MB response arrives byte-identical, 100
 concurrent requests all succeed, and 60 MB of transfers move the daemon's RSS
@@ -92,10 +92,35 @@ browser.
 Backends are always spoken to in plain HTTP over loopback — terminating here is
 the point, so a dev server on `:3000` never needs to know a certificate exists.
 
-**One certificate per daemon.** Server-side SNI needs
-`SSL_CTX_set_tlsext_servername_callback`, which is not bound in
-`vyto/crypto/openssl`; a generated certificate covers every routed domain in
-one SAN list instead, which is what makes the single-cert limit tolerable.
+### Per-domain certificates
+
+Point `--certs` at a directory and each domain gets its own certificate,
+selected during the handshake from the name the client sent:
+
+```
+certs/www.example.com.crt   certs/www.example.com.key
+certs/_.dev.local.crt       certs/_.dev.local.key     ->  *.dev.local
+```
+
+`_` stands in for `*` because a shell expands an asterisk in a filename.
+
+```sh
+vyto-proxyd --tls --certs ./certs
+```
+
+A domain with no certificate of its own falls back to the base one and the
+handshake still completes — so an unrouted name gets an ordinary 404 rather
+than a bare TLS alert, which tells a developer almost nothing.
+
+A `.crt` with no matching `.key`, an unreadable PEM, or a missing directory is
+a startup error. The alternative is a proxy that starts fine and then serves
+the wrong certificate for one domain, which nobody discovers until they visit
+it.
+
+The table is built once at startup. A `SIGHUP` reloads routes, not
+certificates: swapping certificates under live connections would mean keeping
+the old set alive for their lifetime, and a proxy that can be restarted for a
+certificate change does not need that.
 
 ## How it works
 
@@ -133,6 +158,7 @@ RSS by about 1 MB, not 30 MB.
 | `src/proxyd.vt` | the epoll loop |
 | `src/errors.vt` | the 400/404/502 pages |
 | `src/tls.vt` | certificate acquisition: files, or self-signed |
+| `src/sni.vt` | per-domain certificates, loaded from a directory |
 | `src/signal.vt` | pidfile and SIGHUP |
 
 State lives in `$XDG_STATE_HOME/vyto-proxy` (override with `$VYTO_PROXY_HOME`):
@@ -161,11 +187,11 @@ capped at 16 KB.
 make test
 ```
 
-70 checks: unit tests for the table and the header parser, then end-to-end
+80 checks: unit tests for the table and the header parser, then end-to-end
 runs against real backends on loopback — routing, wildcards, keep-alive, a
 3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live
-reload, and the same payload and concurrency set again over TLS against a
-generated certificate. No network access, and every port is picked free at run
+reload, the same payload and concurrency set again over TLS, and SNI serving
+three distinct certificates to the domains that asked for them. No network access, and every port is picked free at run
 time so the suite does not fight whatever else is on the machine.
 
 Two checks are worth keeping honest, and both have been fault-injected to

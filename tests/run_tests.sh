@@ -103,7 +103,22 @@ echo "routes"
 "$DTP" -d '*.dev.local'   -p $B1 >/dev/null
 "$DTP" -d dead.local      -p 9   >/dev/null   # port 9 = discard, nothing listens
 
-"$TMP/vyto-proxyd" -p $PORT --tls --tls-port $TLSPORT --routes "$TMP/state/routes.json" >"$TMP/proxyd.log" 2>&1 &
+# Per-domain certificates, so the SNI path is exercised by the same daemon.
+mkdir -p "$TMP/certs"
+for d in alpha.local beta.local; do
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "$TMP/certs/$d.key" -out "$TMP/certs/$d.crt" -days 30 -nodes \
+        -subj "/CN=$d" -addext "subjectAltName=DNS:$d" >/dev/null 2>&1
+done
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+    -keyout "$TMP/certs/_.wild.local.key" -out "$TMP/certs/_.wild.local.crt" -days 30 -nodes \
+    -subj "/CN=*.wild.local" -addext "subjectAltName=DNS:*.wild.local" >/dev/null 2>&1
+
+"$DTP" -d alpha.local    -p $B1 >/dev/null
+"$DTP" -d beta.local     -p $B1 >/dev/null
+"$DTP" -d '*.wild.local' -p $B1 >/dev/null
+
+"$TMP/vyto-proxyd" -p $PORT --tls --tls-port $TLSPORT --certs "$TMP/certs" --routes "$TMP/state/routes.json" >"$TMP/proxyd.log" 2>&1 &
 PROXY_PID=$!
 sleep 1.5
 
@@ -247,6 +262,50 @@ if [ "$TLSFD2" -le "$((TLSFD + 2))" ]; then
 else
     bad "abandoned TLS transfers release fds" "fds grew $TLSFD -> $TLSFD2"
 fi
+
+
+# --- SNI -------------------------------------------------------------------
+# Each domain has its own certificate, so what is being tested is that the
+# handshake picks the right one from the name the client sent — and that an
+# unknown name still completes against the base certificate rather than
+# failing, because a TLS alert tells a developer far less than a 404 does.
+echo "sni"
+
+servedcn() {
+    echo | timeout 8 openssl s_client -connect 127.0.0.1:$TLSPORT -servername "$1" 2>/dev/null \
+        | openssl x509 -noout -subject 2>/dev/null | sed 's/subject=//; s/ *CN *= *//'
+}
+
+want "sni serves alpha's own certificate"  "$(servedcn alpha.local)" 'alpha.local'
+want "sni serves beta's own certificate"   "$(servedcn beta.local)"  'beta.local'
+want "sni serves the wildcard certificate" "$(servedcn x.wild.local)" '*.wild.local'
+
+# A wildcard covers exactly one label, the same rule the router applies.
+want "wildcard cert does not span two labels" "$(servedcn a.b.wild.local)" 'vyto-proxy local'
+want "wildcard cert does not match the bare domain" "$(servedcn wild.local)" 'vyto-proxy local'
+# A routed domain with no certificate of its own falls back and still works.
+want "unknown sni falls back to the base cert" "$(servedcn www.example.com)" 'vyto-proxy local'
+
+want "traffic flows over a per-domain cert" \
+    "$(curl -sk -m8 --resolve alpha.local:$TLSPORT:127.0.0.1 https://alpha.local:$TLSPORT/ | tr -d '\n')" \
+    '<h1>backend one</h1>'
+
+# Certificate loading refuses a half pair and a bad path at startup, rather
+# than failing later for one domain when somebody happens to visit it.
+mkdir -p "$TMP/halfpair" && cp "$TMP/certs/alpha.local.crt" "$TMP/halfpair/"
+"$TMP/vyto-proxyd" -p $(freeport) --tls --tls-port $(freeport) --certs "$TMP/halfpair" >"$TMP/half.log" 2>&1
+HALF=$?
+case "$(cat "$TMP/half.log")" in
+    *"has no matching alpha.local.key"*) ok "a .crt with no .key is refused at startup" ;;
+    *) bad "a .crt with no .key is refused at startup" "said: $(head -1 "$TMP/half.log")" ;;
+esac
+want "half a pair exits non-zero" "$HALF" '1'
+
+"$TMP/vyto-proxyd" -p $(freeport) --tls --tls-port $(freeport) --certs "$TMP/nosuchdir" >"$TMP/nodir.log" 2>&1
+case "$(cat "$TMP/nodir.log")" in
+    *"no such directory"*) ok "a missing --certs directory is reported, not a panic" ;;
+    *) bad "a missing --certs directory is reported, not a panic" "said: $(head -1 "$TMP/nodir.log")" ;;
+esac
 
 echo "live reload"
 want "unrouted before add" "$(curl -s -m5 -o /dev/null -w '%{http_code}' -H 'Host: late.local' $H/)" '404'

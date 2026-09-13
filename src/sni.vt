@@ -1,0 +1,162 @@
+// Per-domain certificates, chosen during the handshake.
+//
+// One certificate is fine until it isn't: the moment two domains have real
+// certificates from a real CA, they are two separate files and no single
+// context can serve both. SNI is how a client says which name it wants before
+// the server has to produce a certificate, and this is the table that answers.
+//
+// The certificates come from a directory, one pair per domain:
+//
+//     certs/www.example.com.crt   + www.example.com.key
+//     certs/_.dev.local.crt       + _.dev.local.key       -> *.dev.local
+//
+// A directory rather than more flags, because the number of certificates grows
+// with the number of domains and a flag per domain does not scale past about
+// two. `_` stands in for `*` because a shell expands an asterisk in a filename
+// and a user who writes one gets a confusing result rather than a wildcard.
+//
+// The lookup itself lives in C (src/native/src/sni_shim.c) — see that file for
+// why. This module's job is to find the files, build one context per pair, and
+// hand them over before any connection exists.
+
+#link "ssl" if "linux"
+#link "crypto" if "linux"
+
+import { TlsContext, tls_server } from "vyto/crypto/openssl";
+import { file_exists, path_join } from "vyto/io/file";
+import { normalize } from "vyto-proxy/src/routes";
+
+extern "C" {
+    fn vp_sni_new(): rawptr;
+    fn vp_sni_add(table: rawptr, name: cstring, ctx: rawptr): i32;
+    fn vp_sni_install(table: rawptr, base: rawptr): i32;
+    fn vp_sni_count(table: rawptr): i32;
+    fn vp_sni_free(table: rawptr);
+}
+
+const CRT_EXT: string = ".crt";
+const KEY_EXT: string = ".key";
+
+// One loaded pair. The TlsContext is held here for its whole life: the C table
+// borrows the SSL_CTX inside it and does not own it, so dropping this would
+// free a context the handshake still reaches for.
+export class DomainCert {
+    domain: string;     // as it will be matched, e.g. "*.dev.local"
+    ctx: TlsContext;
+
+    fn init(domain: string, ctx: TlsContext) {
+        this.domain = domain;
+        this.ctx = ctx;
+    }
+}
+
+// The certificate set. Owns every context and the C-side lookup table.
+export class SniSet {
+    certs: DomainCert[];
+    table: rawptr;
+    err: string;
+
+    fn init() {
+        this.certs = [];
+        this.table = null;
+        this.err = "";
+    }
+
+    fn count(): int { return this.certs.len; }
+    fn ok(): bool { return this.err.is_empty(); }
+
+    // Attach to the base context, so connections consult the table. The base
+    // keeps serving its own certificate for any name not in the table.
+    fn install(base: TlsContext): bool {
+        if (this.table == null || base == null) { return false; }
+        return (vp_sni_install(this.table, base.handle) as int) == 1;
+    }
+
+    // The C table borrows SSL_CTXs owned by `certs`, so it must not outlive
+    // them. Freeing it here rather than in a deinit on each DomainCert keeps
+    // that ordering explicit.
+    fn close() {
+        if (this.table != null) { vp_sni_free(this.table); this.table = null; }
+    }
+
+    deinit { this.close(); }
+}
+
+// Turn a certificate filename stem into the domain it serves.
+//
+// "_.dev.local" -> "*.dev.local". The rest is passed through normalize, which
+// is the same check the router applies, so a file that cannot name a routable
+// domain is rejected here rather than silently never matching.
+export fn stemToDomain(stem: string): string {
+    if (stem.starts_with("_.")) {
+        let bare = normalize(stem.slice(2, stem.len));
+        if (bare.is_empty()) { return ""; }
+        return "*." + bare;
+    }
+    let d = normalize(stem);
+    if (d.is_empty()) { return ""; }
+    return d;
+}
+
+// Load every .crt/.key pair in `dir`.
+//
+// A .crt with no matching .key is an error, not a skip: it is always a mistake,
+// and a proxy that quietly ignored half a certificate pair would serve the
+// wrong certificate for that domain with no indication why.
+export fn load(dir: string): SniSet {
+    let set = new SniSet();
+    if (dir.is_empty()) { return set; }
+
+    // A missing directory is a typo in --certs, so it is reported like one.
+    // listdir panics on a directory it cannot open, and a stack trace is a poor
+    // way to learn a path is wrong.
+    if (!isdir(dir)) {
+        set.err = "no such directory";
+        return set;
+    }
+
+    set.table = vp_sni_new();
+    if (set.table == null) {
+        set.err = "could not allocate the SNI table";
+        return set;
+    }
+
+    for (let name in listdir(dir)) {
+        if (!name.ends_with(CRT_EXT)) { continue; }
+
+        let stem = name.slice(0, name.len - CRT_EXT.len);
+        let domain = stemToDomain(stem);
+        if (domain.is_empty()) {
+            set.err = `{name}: "{stem}" is not a usable domain`;
+            return set;
+        }
+
+        let keyName = stem + KEY_EXT;
+        let keyPath = path_join(dir, keyName);
+        if (!file_exists(keyPath)) {
+            set.err = `{name} has no matching {keyName}`;
+            return set;
+        }
+
+        let cert = readfile(path_join(dir, name));
+        let key = readfile(keyPath);
+        if (cert.is_empty() || key.is_empty()) {
+            set.err = `{name}: the certificate or key is empty`;
+            return set;
+        }
+
+        let ctx = tls_server(cert, key);
+        if (!ctx.ok()) {
+            set.err = `{name}: {ctx.err}`;
+            return set;
+        }
+
+        // Held before the C table borrows from it.
+        set.certs.push(new DomainCert(domain, ctx));
+        if ((vp_sni_add(set.table, domain.cstr(), ctx.handle) as int) != 1) {
+            set.err = `{name}: could not be added to the SNI table`;
+            return set;
+        }
+    }
+    return set;
+}
