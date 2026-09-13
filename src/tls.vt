@@ -1,0 +1,119 @@
+// TLS termination: getting a server context, from disk or from thin air.
+//
+// The proxy speaks TLS to the world and plain HTTP to backends on localhost.
+// That is the whole point of terminating here — a dev server on :3000 should
+// not need to know a certificate exists.
+
+#link "ssl" if "linux"
+#link "crypto" if "linux"
+
+import { TlsContext, tls_server, ossl_available } from "vyto/crypto/openssl";
+import { file_exists } from "vyto/io/file";
+import { Table } from "vyto-proxy/src/routes";
+
+extern "C" {
+    fn vp_selfsign(names: cstring, cert_out: cstring, cert_cap: i32,
+                   key_out: cstring, key_cap: i32): i32;
+}
+
+// PEM buffers. A P-256 cert and key are well under 2k each; the cap exists so
+// the C side can report "did not fit" instead of truncating into something
+// that fails to parse somewhere much less obvious.
+const PEM_CAP: int = 8192;
+
+// What was loaded, and where it came from — the daemon prints the difference
+// because "your browser will warn" is only true for one of them.
+export const CERT_NONE: int = 0;
+export const CERT_FILES: int = 1;
+export const CERT_SELF: int = 2;
+
+export class CertSource {
+    ctx: TlsContext;
+    kind: int;
+    err: string;
+    names: string;      // the SAN list, for the startup message
+
+    fn init(ctx: TlsContext, kind: int, err: string, names: string) {
+        this.ctx = ctx;
+        this.kind = kind;
+        this.err = err;
+        this.names = names;
+    }
+
+    fn ok(): bool { return this.err.is_empty() && this.ctx != null && this.ctx.ok(); }
+}
+
+fn fail(msg: string): CertSource { return new CertSource(null, CERT_NONE, msg, ""); }
+
+// Load cert and key from PEM files.
+//
+// Both must be present: a cert with no key is not a usable server, and
+// guessing that the key is inside the cert file is the kind of convenience
+// that produces a confusing error one layer down.
+export fn fromFiles(certPath: string, keyPath: string): CertSource {
+    if (!ossl_available()) { return fail("this build has no OpenSSL"); }
+    if (!file_exists(certPath)) { return fail(`no certificate at {certPath}`); }
+    if (!file_exists(keyPath)) { return fail(`no key at {keyPath}`); }
+
+    let cert = readfile(certPath);
+    let key = readfile(keyPath);
+    if (cert.is_empty()) { return fail(`{certPath} is empty`); }
+    if (key.is_empty()) { return fail(`{keyPath} is empty`); }
+
+    let ctx = tls_server(cert, key);
+    if (!ctx.ok()) { return fail(`{certPath}: {ctx.err}`); }
+    return new CertSource(ctx, CERT_FILES, "", "");
+}
+
+// Generate a self-signed certificate covering localhost and every domain in
+// the route table.
+//
+// Wildcard routes become wildcard SANs, which is exactly what a *.dev.local
+// route wants. A wildcard SAN matches one label, so "*.dev.local" covers
+// "a.dev.local" and not "a.b.dev.local" — the same rule the router applies, by
+// coincidence of both following the same convention rather than by shared code.
+export fn selfSigned(t: Table): CertSource {
+    if (!ossl_available()) { return fail("this build has no OpenSSL"); }
+
+    let names = sanList(t);
+    let cert = bytes(PEM_CAP);
+    let key = bytes(PEM_CAP);
+    let r = vp_selfsign(names.cstr(), cert as cstring, PEM_CAP as i32,
+                        key as cstring, PEM_CAP as i32) as int;
+    if (r != 1) { return fail("could not generate a self-signed certificate"); }
+
+    let ctx = tls_server(str(cert as cstring), str(key as cstring));
+    if (!ctx.ok()) { return fail(`generated certificate rejected: {ctx.err}`); }
+    return new CertSource(ctx, CERT_SELF, "", names);
+}
+
+// Build the SAN list. Always localhost and 127.0.0.1, plus the routed domains.
+//
+// Capped at 64 entries: a SAN list is linear in a certificate and a table with
+// hundreds of domains wants real certificates, not one generated cert naming
+// all of them.
+fn sanList(t: Table): string {
+    let out = "DNS:localhost,IP:127.0.0.1,IP:::1";
+    let n = 0;
+    for (let r in t.all()) {
+        if (n >= 64) { break; }
+        let d = r.display();
+        if (d == "localhost") { continue; }
+        out = out + ",DNS:" + d;
+        n += 1;
+    }
+    return out;
+}
+
+// The whole policy in one place: explicit files if given, otherwise generate.
+//
+// Asking for --cert without --key (or the reverse) is an error rather than a
+// silent fall back to self-signed, because a typo'd path would otherwise leave
+// a server quietly serving a certificate nobody trusts.
+export fn acquire(certPath: string, keyPath: string, t: Table): CertSource {
+    let hasC = !certPath.is_empty();
+    let hasK = !keyPath.is_empty();
+    if (hasC != hasK) { return fail("--cert and --key must be given together"); }
+    if (hasC) { return fromFiles(certPath, keyPath); }
+    return selfSigned(t);
+}

@@ -14,9 +14,20 @@ cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
 VYTOC=${VYTOC:-/home/eric/voltlang/vytoc}
 TMP="$ROOT/tests/tmp"
-PORT=${PORT:-18080}
-B1=${B1:-18099}     # static backend
-B2=${B2:-19200}     # echo backend, threaded, keep-alive
+# Ports are picked free at run time rather than fixed. A fixed port makes the
+# suite fail for a reason that has nothing to do with the proxy the moment
+# anything else on the machine — including a previous debugging session — is
+# holding it, and that failure looks exactly like a real one.
+freeport() {
+    python3 -c "
+import socket
+s = socket.socket(); s.bind(('127.0.0.1', 0))
+print(s.getsockname()[1]); s.close()"
+}
+PORT=${PORT:-$(freeport)}
+TLSPORT=${TLSPORT:-$(freeport)}
+B1=${B1:-$(freeport)}     # static backend
+B2=${B2:-$(freeport)}     # echo backend, threaded, keep-alive
 PASS=0
 FAIL=0
 
@@ -92,7 +103,7 @@ echo "routes"
 "$DTP" -d '*.dev.local'   -p $B1 >/dev/null
 "$DTP" -d dead.local      -p 9   >/dev/null   # port 9 = discard, nothing listens
 
-"$TMP/vyto-proxyd" -p $PORT --routes "$TMP/state/routes.json" >"$TMP/proxyd.log" 2>&1 &
+"$TMP/vyto-proxyd" -p $PORT --tls --tls-port $TLSPORT --routes "$TMP/state/routes.json" >"$TMP/proxyd.log" 2>&1 &
 PROXY_PID=$!
 sleep 1.5
 
@@ -171,6 +182,70 @@ if [ "$RSS2" -lt "$((RSS + 8192))" ]; then
     ok "60MB of transfers do not grow RSS (${RSS}kB -> ${RSS2}kB)"
 else
     bad "60MB of transfers do not grow RSS" "${RSS}kB -> ${RSS2}kB"
+fi
+
+
+# --- TLS -------------------------------------------------------------------
+# No --cert was given, so the daemon generated a self-signed certificate at
+# startup covering every routed domain. curl -k accepts it; what is being tested
+# is the termination path, not the trust decision.
+echo "tls"
+S="https://127.0.0.1:$TLSPORT"
+CURLK="curl -sk --resolve www.example.com:$TLSPORT:127.0.0.1 --resolve echo.local:$TLSPORT:127.0.0.1 --resolve nope.invalid:$TLSPORT:127.0.0.1"
+
+want "https routes to the backend" \
+    "$($CURLK -m8 https://www.example.com:$TLSPORT/ | tr -d '\n')" '<h1>backend one</h1>'
+want "https unknown host is 404" \
+    "$($CURLK -m8 -o /dev/null -w '%{http_code}' https://nope.invalid:$TLSPORT/)" '404'
+
+# The generated certificate must actually name the routed domains, or a browser
+# rejects it for a reason that has nothing to do with self-signing.
+SAN=$(echo | timeout 8 openssl s_client -connect 127.0.0.1:$TLSPORT -servername www.example.com 2>/dev/null \
+      | openssl x509 -noout -text 2>/dev/null | grep -A1 'Subject Alternative Name' | tail -1)
+case "$SAN" in
+    *www.example.com*) ok "generated cert names the routed domain" ;;
+    *) bad "generated cert names the routed domain" "SANs were: $SAN" ;;
+esac
+
+# TLS is where a want-read/want-write mix-up shows up: a bug there survives
+# small responses and hangs on large ones.
+$CURLK -m40 https://www.example.com:$TLSPORT/big.bin -o "$TMP/tlsbig.bin"
+want "3MB over TLS is byte-identical" "$(md5sum "$TMP/tlsbig.bin" | cut -d' ' -f1)" "$BIGSUM"
+
+$CURLK -m20 --data-binary @"$TMP/post.txt" https://echo.local:$TLSPORT/ -o "$TMP/tlsechoed.txt"
+want "100KB POST over TLS round-trips" \
+    "$(md5sum "$TMP/tlsechoed.txt" | cut -d' ' -f1)" "$(md5sum "$TMP/post.txt" | cut -d' ' -f1)"
+
+KAT=$($CURLK -m10 -o /dev/null -w '%{num_connects}' \
+      https://echo.local:$TLSPORT/a https://echo.local:$TLSPORT/b 2>/dev/null | tail -c1)
+want "TLS keep-alive reuses one session" "$KAT" '0'
+
+TCODES=$(seq 1 40 | xargs -P 10 -I{} curl -sk -m20 -o /dev/null -w '%{http_code}\n' \
+         --resolve www.example.com:$TLSPORT:127.0.0.1 https://www.example.com:$TLSPORT/ | sort -u | tr -d '\n')
+want "40 concurrent https requests all 200" "$TCODES" '200'
+
+# Plain HTTP must be unaffected by TLS being on — both listeners, no redirect.
+want "plain http still served alongside tls" \
+    "$(curl -s -m5 -H 'Host: www.example.com' $H/ | tr -d '\n')" '<h1>backend one</h1>'
+
+TLSFD=$(ls /proc/$PROXY_PID/fd 2>/dev/null | wc -l)
+for i in $(seq 1 8); do
+    (timeout 12 python3 -c "
+import socket,ssl
+c=ssl.create_default_context(); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE
+s=c.wrap_socket(socket.create_connection(('127.0.0.1',$TLSPORT)),server_hostname='www.example.com')
+s.sendall(b'GET /big.bin HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n')
+for _ in range(4):
+    d=s.recv(4096)
+    if not d: break
+s.close()" >/dev/null 2>&1 &)
+done
+sleep 7
+TLSFD2=$(ls /proc/$PROXY_PID/fd 2>/dev/null | wc -l)
+if [ "$TLSFD2" -le "$((TLSFD + 2))" ]; then
+    ok "abandoned TLS transfers release fds ($TLSFD -> $TLSFD2)"
+else
+    bad "abandoned TLS transfers release fds" "fds grew $TLSFD -> $TLSFD2"
 fi
 
 echo "live reload"

@@ -17,7 +17,9 @@
 // the buffers are fixed-size rather than a growing StringBuilder.
 
 import { Socket } from "vyto/net/socket";
+import { TlsConn, OSSL_WANT_READ, OSSL_WANT_WRITE, OSSL_FAILED } from "vyto/crypto/openssl";
 
+export const PH_HANDSHAKE:  int = 5;   // TLS only: before any HTTP exists
 export const PH_READ_HEAD:  int = 0;
 export const PH_CONNECTING: int = 1;
 export const PH_PIPING:     int = 2;
@@ -28,6 +30,24 @@ export const PH_CLOSED:     int = 4;
 // the point past which more buffer stops buying throughput and starts buying
 // latency — bytes sat in our buffer are bytes the kernel could not pace.
 export const BUF_SIZE: int = 65536;
+
+
+// ---- the IO seam ----------------------------------------------------------
+//
+// A tunnel's client side is either a plain socket or a TLS connection, and the
+// pipe loop must not care which. These two codes are what the loop reacts to;
+// everything else is a byte count.
+//
+// IO_WANT_READ and IO_WANT_WRITE exist separately because TLS genuinely needs
+// both: an SSL *read* can block waiting for the socket to become WRITABLE (a
+// TLS 1.3 key update, a renegotiation), and an SSL write can block on
+// readability. Code that always re-arms for readability after a blocked read
+// works fine for months and then hangs on a long-lived connection under load.
+// See lib/vyto/crypto/openssl/openssl.vt:185.
+export const IO_WANT_READ:  int = -1;
+export const IO_WANT_WRITE: int = -2;
+export const IO_ERROR:      int = -3;
+export const IO_EOF:        int = 0;
 
 // A fixed-size byte buffer with a read cursor, so a partial write resumes
 // where it stopped instead of re-slicing the remainder.
@@ -74,6 +94,7 @@ export class Buf {
 // A client connection and everything owed to it.
 export class Tunnel {
     front: Socket;          // the client
+    tls: TlsConn;           // non-null when the client side is TLS
     back: Socket;           // the backend; null until a route is chosen
     phase: int;
 
@@ -91,10 +112,16 @@ export class Tunnel {
     front_dead: bool;       // client is UNREACHABLE: a write to it failed
     back_dead: bool;        // backend is unreachable
 
+    // What the TLS layer last asked to wait for. Only meaningful when tls is
+    // non-null: OpenSSL's needed direction is a property of its internal state,
+    // not of our buffers, so it cannot be recomputed and must be remembered.
+    tls_want_write: bool;
+
     last_ms: i64;           // last activity, for the idle sweep
 
     fn init(front: Socket, now: i64) {
         this.front = front;
+        this.tls = null;
         this.back = null;
         this.phase = PH_READ_HEAD;
         this.head = bytes(1024);      // grows to MAX_HEAD only if needed
@@ -107,6 +134,7 @@ export class Tunnel {
         this.back_eof = false;
         this.front_dead = false;
         this.back_dead = false;
+        this.tls_want_write = false;
         this.last_ms = now;
     }
 
@@ -135,11 +163,61 @@ export class Tunnel {
         return true;
     }
 
+
+    // ---- client-side IO, plain or TLS ----
+    //
+    // Every read from and write to the client goes through these two, so the
+    // pipe loop has exactly one code path. The plain arm is a straight
+    // delegation; the TLS arm translates OpenSSL's sentinels into ours.
+
+    fn isTls(): bool { return this.tls != null; }
+
+    // Read up to `n` bytes into `dst`. Returns the count, IO_EOF, or one of the
+    // IO_WANT_*/IO_ERROR codes.
+    fn frontRead(dst: byte[], n: int): int {
+        if (this.front == null) { return IO_ERROR; }
+        if (this.tls != null) {
+            let r = this.tls.readInto(dst, n);
+            if (r > 0) { return r; }
+            if (r == 0) { return IO_EOF; }
+            if (r == OSSL_WANT_READ) { return IO_WANT_READ; }
+            if (r == OSSL_WANT_WRITE) { return IO_WANT_WRITE; }
+            return IO_ERROR;
+        }
+        let r = this.front.tryRecv(n);
+        if (r.status > 0) {
+            let i = 0;
+            while (i < r.status) { dst[i] = r.data[i]; i += 1; }
+            return r.status;
+        }
+        if (r.status == 0) { return IO_EOF; }
+        if (r.status == -1) { return IO_WANT_READ; }
+        return IO_ERROR;
+    }
+
+    // Write src[off..off+n) to the client. May be short.
+    fn frontWrite(src: byte[], off: int, n: int): int {
+        if (this.front == null) { return IO_ERROR; }
+        if (this.tls != null) {
+            let r = this.tls.writeFrom(src, off, n);
+            if (r > 0) { return r; }
+            if (r == OSSL_WANT_READ) { return IO_WANT_READ; }
+            if (r == OSSL_WANT_WRITE) { return IO_WANT_WRITE; }
+            return IO_ERROR;
+        }
+        let sent = this.front.trySendRaw(src as cstring, off, n);
+        if (sent >= 0) { return sent; }
+        if (sent == -1) { return IO_WANT_WRITE; }
+        return IO_ERROR;
+    }
+
     // Should we be watching the client for readable data? No once it has
     // half-closed, and no while the buffer it feeds is full — that is the
     // backpressure that bounds memory.
     fn wantFrontRead(): bool {
         if (this.front_eof || this.front_dead || this.back_dead) { return false; }
+        // During the handshake OpenSSL dictates the direction, not our buffers.
+        if (this.phase == PH_HANDSHAKE) { return !this.tls_want_write; }
         if (this.phase == PH_READ_HEAD) { return true; }
         if (this.phase != PH_PIPING) { return false; }
         return !this.f2b.isFull();
@@ -151,7 +229,14 @@ export class Tunnel {
         return !this.b2f.isFull();
     }
 
-    fn wantFrontWrite(): bool { return !this.front_dead && !this.b2f.isEmpty(); }
+    fn wantFrontWrite(): bool {
+        if (this.front_dead) { return false; }
+        if (this.phase == PH_HANDSHAKE) { return this.tls_want_write; }
+        // A TLS read that blocked on writability must be re-armed for write
+        // even with nothing of ours to send.
+        if (this.tls != null && this.tls_want_write) { return true; }
+        return !this.b2f.isEmpty();
+    }
     fn wantBackWrite(): bool  { return !this.back_dead && !this.f2b.isEmpty(); }
 
     // Done when neither side can make progress: both directions drained and at
@@ -170,6 +255,7 @@ export class Tunnel {
     fn finished(): bool {
         if (this.phase == PH_CLOSED) { return true; }
         if (this.phase == PH_ERROR) { return this.b2f.isEmpty() || this.front_dead; }
+        if (this.phase == PH_HANDSHAKE) { return this.front_dead; }
         if (this.phase != PH_PIPING) { return false; }
 
         // Either peer unreachable: nothing left to deliver in either direction.
@@ -186,6 +272,9 @@ export class Tunnel {
     }
 
     fn close() {
+        // The TLS object wraps the fd, so it is shut down before the socket is
+        // closed underneath it.
+        if (this.tls != null) { this.tls.close(); this.tls = null; }
         if (this.front != null) { this.front.close(); this.front = null; }
         if (this.back != null) { this.back.close(); this.back = null; }
         this.phase = PH_CLOSED;

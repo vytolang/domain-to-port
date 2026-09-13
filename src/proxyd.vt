@@ -20,12 +20,15 @@ import { Socket, PollSet, RecvResult, socket_listen_on, socket_connect_async,
 import { cli, Cli } from "vyto/cli";
 import { exit, getenv } from "vyto/os";
 import { monoMs } from "vyto/util/time";  // monotonic: an idle timeout must not jump when the wall clock does
-import { Table, readTable } from "vyto-proxy/src/routes";
+import { Table, readTable, normalize } from "vyto-proxy/src/routes";
 import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
 import { writePidFile, removePidFile } from "vyto-proxy/src/signal";
 import { headEnd, hostHeader, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
-import { Tunnel, Buf, BUF_SIZE, PH_READ_HEAD, PH_CONNECTING, PH_PIPING,
-         PH_ERROR, PH_CLOSED } from "vyto-proxy/src/tunnel";
+import { Tunnel, Buf, BUF_SIZE, PH_HANDSHAKE, PH_READ_HEAD, PH_CONNECTING,
+         PH_PIPING, PH_ERROR, PH_CLOSED, IO_WANT_READ, IO_WANT_WRITE,
+         IO_ERROR, IO_EOF } from "vyto-proxy/src/tunnel";
+import { TlsContext, tls_accept, OSSL_WANT_READ, OSSL_WANT_WRITE } from "vyto/crypto/openssl";
+import { CertSource, acquire, CERT_SELF, CERT_FILES } from "vyto-proxy/src/tls";
 import { badGateway, noRoute, badRequest } from "vyto-proxy/src/errors";
 
 export const VERSION: string = "0.1.0";
@@ -60,7 +63,9 @@ extern "C" {
 export class Proxy {
     table: Table;
     routes_file: string;
-    listener: Socket;
+    listener: Socket;       // plain HTTP
+    tls_listener: Socket;   // TLS, null unless --tls
+    tls_ctx: TlsContext;    // the server certificate, null unless --tls
     poll: PollSet;
 
     // Tunnels indexed by fd. Both of a tunnel's fds point at the same object,
@@ -79,6 +84,8 @@ export class Proxy {
         this.routes_file = routes_file;
         this.table = new Table();
         this.listener = null;
+        this.tls_listener = null;
+        this.tls_ctx = null;
         this.poll = null;
         this.slots = [];
         this.hi_fd = 0;
@@ -131,8 +138,18 @@ export class Proxy {
         return this.poll.add(this.listener, POLL_READ);
     }
 
+    fn listenTls(host: string, port: int, backlog: int, ctx: TlsContext): bool {
+        this.tls_ctx = ctx;
+        this.tls_listener = socket_listen_on(host, port, backlog);
+        if (this.tls_listener == null) { return false; }
+        if (!this.tls_listener.setNonBlocking(true)) { return false; }
+        return this.poll.add(this.tls_listener, POLL_READ);
+    }
+
     fn run() {
         let lfd = this.listener.fd as int;
+        let tfd = -1;
+        if (this.tls_listener != null) { tfd = this.tls_listener.fd as int; }
         this.last_sweep = monoMs();
 
         while (this.running) {
@@ -151,7 +168,8 @@ export class Proxy {
                 while (i < n) {
                     let fd = this.poll.readyFd(i);
                     let ev = this.poll.readyEvents(i);
-                    if (fd == lfd) { this.acceptBurst(now); }
+                    if (fd == lfd) { this.acceptBurst(this.listener, false, now); }
+                    else if (fd == tfd) { this.acceptBurst(this.tls_listener, true, now); }
                     else { this.service(fd, ev, now); }
                     i += 1;
                 }
@@ -166,18 +184,54 @@ export class Proxy {
 
     // Drain the accept queue. One wakeup can mean many pending connections, and
     // accepting only one per wakeup gives away most of the throughput.
-    fn acceptBurst(now: i64) {
+    fn acceptBurst(lis: Socket, is_tls: bool, now: i64) {
         while (true) {
             if (this.live >= MAX_CONNS) { return; }
-            let c = this.listener.tryAccept();
+            let c = lis.tryAccept();
             if (c == null) { return; }
             c.setNoDelay(true);          // a proxy hop must not add Nagle delay
             let t = new Tunnel(c, now);
             let fd = c.fd as int;
+
+            if (is_tls) {
+                // tls_accept wraps the fd but does not handshake; the handshake
+                // is driven by the loop, a step at a time, because the socket is
+                // non-blocking.
+                t.tls = tls_accept(this.tls_ctx, fd);
+                if (t.tls == null || !t.tls.ok()) { c.close(); continue; }
+                t.phase = PH_HANDSHAKE;
+            }
+
             this.attach(fd, t);
             this.live += 1;
             this.poll.add(c, POLL_READ);
         }
+    }
+
+    // Drive one handshake step and re-arm for whichever direction OpenSSL
+    // asked for. Waiting on the wrong direction here is a hang, not an error.
+    fn handshake(t: Tunnel) {
+        let r = t.tls.handshakeStep();
+        if (r == 1) {
+            t.tls_want_write = false;
+            t.phase = PH_READ_HEAD;
+            // Read straight away rather than waiting for another epoll wakeup.
+            //
+            // The final handshake flight and the client's first request often
+            // arrive in the same TCP segment, so by the time the handshake
+            // completes those request bytes are already buffered INSIDE the SSL
+            // object — consumed from the socket, invisible to epoll. Waiting for
+            // readability there is waiting for a packet that has already been
+            // delivered, and the connection hangs until the idle sweep.
+            this.readHead(t);
+            return;
+        }
+        if (r == OSSL_WANT_READ) { t.tls_want_write = false; return; }
+        if (r == OSSL_WANT_WRITE) { t.tls_want_write = true; return; }
+        // A failed handshake gets no HTTP reply: the peer has no TLS session to
+        // read one over, so anything we sent would be unframed noise.
+        this.log(`tls handshake failed: {t.tls.lastError()}`);
+        t.front_dead = true;
     }
 
     fn service(fd: int, ev: int, now: i64) {
@@ -188,7 +242,9 @@ export class Proxy {
 
         let is_front = t.front != null && (t.front.fd as int) == fd;
 
-        if (t.phase == PH_READ_HEAD) {
+        if (t.phase == PH_HANDSHAKE) {
+            if (is_front) { this.handshake(t); }
+        } else if (t.phase == PH_READ_HEAD) {
             if (is_front) { this.readHead(t); }
         } else if (t.phase == PH_CONNECTING) {
             if (!is_front) { this.finishConnect(t); }
@@ -205,11 +261,18 @@ export class Proxy {
     // ---- phase: reading the head ----
 
     fn readHead(t: Tunnel) {
-        let r = t.front.tryRecv(4096);
-        if (r.wouldBlock()) { return; }
-        if (r.status <= 0) { t.front_eof = true; t.phase = PH_CLOSED; return; }
+        // Through the seam: on a TLS connection these bytes come out of the SSL
+        // object, not off the socket. Reading the socket directly here would
+        // hand the parser ciphertext, which never resolves into a header block.
+        let buf = bytes(4096);
+        let n = t.frontRead(buf, 4096);
+        if (n == IO_WANT_READ) { t.tls_want_write = false; return; }
+        if (n == IO_WANT_WRITE) { t.tls_want_write = true; return; }
+        if (n == IO_EOF) { t.front_eof = true; t.phase = PH_CLOSED; return; }
+        if (n < 0) { t.front_dead = true; return; }
+        t.tls_want_write = false;
 
-        if (!t.headAppend(r.data, r.status, MAX_HEAD)) {
+        if (!t.headAppend(buf, n, MAX_HEAD)) {
             this.fail(t, badRequest());
             return;
         }
@@ -221,13 +284,21 @@ export class Proxy {
         let raw = hostHeader(t.head, t.head_len);
         if (raw.is_empty()) { this.fail(t, badRequest()); return; }
 
-        let port = this.table.lookup(raw);
+        // Normalize once, and use the normalized name everywhere the user sees
+        // it. A Host of "app.local:8443" routes fine — lookup strips the port —
+        // but echoing the raw value into an error page produces a
+        // `domain-to-port -d app.local:8443` suggestion that would be rejected
+        // as an unusable domain if anyone pasted it.
+        let host = normalize(raw);
+        if (host.is_empty()) { this.fail(t, badRequest()); return; }
+
+        let port = this.table.lookup(host);
         if (port == 0) {
-            this.log(`404 {raw}`);
-            this.fail(t, noRoute(raw));
+            this.log(`404 {host}`);
+            this.fail(t, noRoute(host));
             return;
         }
-        t.host = raw;
+        t.host = host;
         t.port = port;
 
         // Everything read so far — head and any body bytes that arrived with
@@ -287,22 +358,36 @@ export class Proxy {
 
     // src -> buf
     fn move(t: Tunnel, s: Socket, buf: Buf, from_front: bool) {
-        if (s == null) { return; }
         let room = buf.space();
         if (room <= 0) { return; }
         let want = room;
         if (want > 32768) { want = 32768; }
+
+        if (from_front) {
+            // Through the seam: plain or TLS, the loop does not branch.
+            let tmp = bytes(want);
+            let n = t.frontRead(tmp, want);
+            if (n == IO_WANT_READ) { t.tls_want_write = false; return; }
+            if (n == IO_WANT_WRITE) { t.tls_want_write = true; return; }
+            if (n == IO_EOF) { t.front_eof = true; return; }
+            if (n < 0) { t.front_dead = true; return; }
+            t.tls_want_write = false;
+            buf.append(tmp, n);
+            return;
+        }
+
+        if (s == null) { return; }
         let r = s.tryRecv(want);
         if (r.wouldBlock()) { return; }
         if (r.status == 0) {
             // Clean EOF: the peer stopped talking but may still be listening.
-            if (from_front) { t.front_eof = true; } else { t.back_eof = true; }
+            t.back_eof = true;
             return;
         }
         if (r.status < 0) {
             // A read error (ECONNRESET and friends) means the peer is gone in
             // both directions, not merely done sending.
-            if (from_front) { t.front_dead = true; } else { t.back_dead = true; }
+            t.back_dead = true;
             return;
         }
         buf.append(r.data, r.status);
@@ -310,19 +395,32 @@ export class Proxy {
 
     // buf -> dst, resuming a partial write from the offset.
     fn flush(t: Tunnel, s: Socket, buf: Buf, to_front: bool) {
-        if (s == null) { return; }
         while (!buf.isEmpty()) {
             let n = buf.pending();
-            let sent = s.trySendRaw(buf.data as cstring, buf.off, n);
-            if (sent == -1) { return; }              // would block; poll will call us
-            if (sent < 0) {
-                // A failed write means this peer cannot receive anything ever
-                // again — distinct from EOF, which only means it stopped
-                // talking. Marking it dead lets finished() tear the tunnel down
-                // now rather than leaving both fds to the idle sweep.
-                if (to_front) { t.front_dead = true; } else { t.back_dead = true; }
-                return;
+            let sent = 0;
+
+            if (to_front) {
+                sent = t.frontWrite(buf.data, buf.off, n);
+                // A TLS write can block on READABILITY, so the direction to
+                // wait for is whatever OpenSSL said, not "writable".
+                if (sent == IO_WANT_READ) { t.tls_want_write = false; return; }
+                if (sent == IO_WANT_WRITE) { t.tls_want_write = true; return; }
+                if (sent < 0) { t.front_dead = true; return; }
+                t.tls_want_write = false;
+            } else {
+                if (s == null) { return; }
+                sent = s.trySendRaw(buf.data as cstring, buf.off, n);
+                if (sent == -1) { return; }          // would block; poll will call us
+                if (sent < 0) {
+                    // A failed write means this peer cannot receive anything
+                    // ever again — distinct from EOF, which only means it
+                    // stopped talking. Marking it dead lets finished() tear the
+                    // tunnel down now rather than leaving both fds to the sweep.
+                    t.back_dead = true;
+                    return;
+                }
             }
+
             buf.off += sent;
             if (buf.isEmpty()) { buf.compact(); return; }
             if (sent == 0) { return; }
@@ -405,6 +503,10 @@ fn main() {
     app.intOption("port", "port to listen on").short("p").meta("PORT").dfltInt(80);
     app.option("host", "address to bind").meta("ADDR").dflt("0.0.0.0");
     app.option("routes", "routes file to read").meta("PATH");
+    app.flag("tls", "also terminate TLS (on --tls-port)");
+    app.intOption("tls-port", "port for TLS").meta("PORT").dfltInt(443);
+    app.option("cert", "certificate chain, PEM (leaf first)").meta("PATH");
+    app.option("key", "private key, PEM").meta("PATH");
     app.flag("verbose", "log every routing decision").short("v");
     app.flag("version", "print the version and exit");
 
@@ -439,12 +541,38 @@ fn main() {
         exit(1);
     }
 
+    // TLS second, so a certificate problem is reported after we know the plain
+    // listener works — and so --tls failing never silently costs you :80.
+    let tls_line = "";
+    if (app.on("tls")) {
+        let src = acquire(app.get("cert"), app.get("key"), p.table);
+        if (!src.ok()) {
+            print(`vyto-proxyd: TLS: {src.err}`);
+            exit(1);
+        }
+        let tport = app.getInt("tls-port");
+        if (!p.listenTls(host, tport, 512, src.ctx)) {
+            print(`vyto-proxyd: cannot listen on {host}:{tport}`);
+            if (tport < 1024) {
+                print("  ports below 1024 need privilege. Grant it once with:");
+                print("    sudo setcap cap_net_bind_service=+ep ./vyto-proxyd");
+            }
+            exit(1);
+        }
+        if (src.kind == CERT_SELF) {
+            tls_line = `TLS on {host}:{tport} with a SELF-SIGNED certificate — browsers will warn`;
+        } else {
+            tls_line = `TLS on {host}:{tport}`;
+        }
+    }
+
     if (!writePidFile(pidPath())) {
         print(`vyto-proxyd: cannot write {pidPath()}`);
         exit(1);
     }
 
     print(`vyto-proxyd listening on {host}:{port} — {p.table.count()} route(s)`);
+    if (!tls_line.is_empty()) { print("  " + tls_line); }
     p.run();
     removePidFile(pidPath());
 }
