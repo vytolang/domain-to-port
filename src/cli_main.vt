@@ -1,0 +1,149 @@
+// domain-to-port — the whole user interface.
+//
+//     domain-to-port -d www.example.com -p 8099      add or replace
+//     domain-to-port -d www.example.com --rm         remove
+//     domain-to-port --list                          show the table
+//
+// The flags are the headline form from the design and everything else is a
+// subcommand-free variation on it, because the tool's promise is that one line
+// works instantly and a tool whose first example needs a subcommand has already
+// broken that.
+//
+// Every path through here ends by telling the user what the proxy will actually
+// do now — whether the daemon picked the change up, or why it didn't. A route
+// that is in the file but not in the running proxy is the failure this tool
+// exists to prevent, so it is never reported as plain success.
+
+import { cli, Cli } from "vyto/cli";
+import { exit } from "vyto/os";
+import { Table, Route, readTable, writeTable, normalize, valid_port } from "vyto-proxy/src/routes";
+import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
+import { signalDaemon, SIGHUP, REACH_OK, REACH_NO_FILE, REACH_STALE,
+         REACH_DENIED, REACH_BAD_FILE } from "vyto-proxy/src/signal";
+
+export const VERSION: string = "0.1.0";
+
+fn main() {
+    let app = new Cli("domain-to-port", "map a domain to a local port, instantly");
+    app.option("domain", "the domain to route, e.g. www.example.com or *.dev.local")
+       .short("d").meta("DOMAIN");
+    app.intOption("port", "the local port to send it to").short("p").meta("PORT");
+    app.flag("rm", "remove the route for --domain instead of adding one");
+    app.flag("list", "print the current table and exit").short("l");
+    app.flag("version", "print the version and exit");
+
+    if (!app.parse(args())) {
+        print(app.report());
+        exit(app.exitCode());
+    }
+    if (app.helpWanted()) { print(app.usage()); return; }
+    if (app.on("version")) { print("domain-to-port " + VERSION); return; }
+
+    if (!ensureStateDir()) {
+        print(`domain-to-port: cannot create {stateDir()}`);
+        exit(1);
+    }
+
+    let path = routesPath();
+    let t = readTable(path);
+    if (!t.ok()) {
+        // Refusing here is the whole point: writing a fresh table over a file
+        // we failed to parse would silently discard every route in it.
+        print(`domain-to-port: {path}: {t.err}`);
+        print("Fix or delete the file; refusing to overwrite routes that may still be good.");
+        exit(1);
+    }
+
+    if (app.on("list")) { listTable(t, path); return; }
+
+    let domain = app.get("domain");
+    if (domain.is_empty()) {
+        print(app.usage());
+        exit(2);
+    }
+    if (normalize(domain).is_empty()) {
+        print(`domain-to-port: "{domain}" is not a usable domain`);
+        exit(2);
+    }
+
+    if (app.on("rm")) { doRemove(t, path, domain); return; }
+
+    if (!app.seen("port")) {
+        print("domain-to-port: --port is required when adding a route");
+        print(`  try: domain-to-port -d {domain} -p 8099`);
+        exit(2);
+    }
+    let port = app.getInt("port");
+    if (!valid_port(port)) {
+        print(`domain-to-port: port {port} is outside 1-65535`);
+        exit(2);
+    }
+    doAdd(t, path, domain, port);
+}
+
+fn doAdd(t: Table, path: string, domain: string, port: int) {
+    let had = t.lookup(normalize(domain));
+    t.put(domain, port);
+    if (!writeTable(path, t)) {
+        print(`domain-to-port: cannot write {path}`);
+        exit(1);
+    }
+    if (had == port) { print(`{domain} -> :{port} (unchanged)`); }
+    else if (had != 0) { print(`{domain} -> :{port} (was :{had})`); }
+    else { print(`{domain} -> :{port}`); }
+    reportReload();
+}
+
+fn doRemove(t: Table, path: string, domain: string) {
+    if (!t.remove(domain)) {
+        print(`domain-to-port: no route for {domain}`);
+        exit(1);
+    }
+    if (!writeTable(path, t)) {
+        print(`domain-to-port: cannot write {path}`);
+        exit(1);
+    }
+    print(`removed {domain}`);
+    reportReload();
+}
+
+fn listTable(t: Table, path: string) {
+    let rs = t.all();
+    if (rs.len == 0) {
+        print("no routes yet");
+        print("  add one: domain-to-port -d www.example.com -p 8099");
+        return;
+    }
+    // Pad to the longest name so the arrows line up — a table read by eye
+    // every day earns the two lines this costs.
+    let w = 0;
+    for (let r in rs) { if (r.display().len > w) { w = r.display().len; } }
+    for (let r in rs) {
+        let name = r.display();
+        let pad = "";
+        let i = name.len;
+        while (i < w) { pad = pad + " "; i += 1; }
+        print(`  {name}{pad}  ->  :{r.port}`);
+    }
+    print(`{rs.len} route(s) in {path}`);
+}
+
+// Tell the daemon, then tell the user what that achieved. The file is already
+// written at this point, so every branch here is about whether the change is
+// live *now* or waiting for a start.
+fn reportReload() {
+    let r = signalDaemon(pidPath(), SIGHUP);
+    if (r == REACH_OK) { print("  reloaded"); return; }
+    if (r == REACH_NO_FILE || r == REACH_STALE) {
+        print("  saved — proxy is not running (start it with: vyto-proxyd)");
+        return;
+    }
+    if (r == REACH_DENIED) {
+        print("  saved — but the running proxy belongs to another user; it has not reloaded");
+        return;
+    }
+    if (r == REACH_BAD_FILE) {
+        print(`  saved — {pidPath()} is unreadable; the proxy has not reloaded`);
+        return;
+    }
+}

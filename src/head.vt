@@ -1,0 +1,142 @@
+// Just enough HTTP to find the Host header.
+//
+// A proxy does not need to understand a request, only to route it. So this
+// reads the header block, extracts Host, and stops — everything after the
+// blank line is opaque bytes forwarded verbatim. That is what lets the proxy
+// carry request bodies, WebSocket upgrades and HTTP methods it has never heard
+// of without knowing anything about them.
+//
+// vyto/net/server has a real parser but it is private to Server and serves a
+// different goal: it validates a request it is about to *answer*. Here, strict
+// validation would be actively wrong — rejecting a request the backend would
+// have accepted makes the proxy a worse version of the server behind it.
+//
+// The two things this is strict about are the two that are ours, not the
+// backend's: the header block has a size limit (a client that never sends
+// CRLFCRLF must not grow our buffer forever), and a Host with a CR, LF or NUL
+// in it is refused rather than normalized, because the domain it names is
+// about to pick a backend.
+
+export const HEAD_INCOMPLETE: int = -1;   // no CRLFCRLF yet, read more
+export const HEAD_TOO_LARGE:  int = -2;   // over the cap before the block ended
+export const HEAD_BAD:        int = -3;   // malformed enough to be unroutable
+
+// The biggest header block accepted, in bytes. Nginx defaults to 8k of large
+// headers; 16k is comfortably above anything legitimate and still a hard bound
+// on what one unauthenticated connection can make us hold.
+export const MAX_HEAD: int = 16384;
+
+const CH_CR:    int = 13;
+const CH_LF:    int = 10;
+const CH_COLON: int = 58;
+const CH_SP:    int = 32;
+const CH_TAB:   int = 9;
+const CH_NUL:   int = 0;
+const CH_A:     int = 65;
+const CH_Z:     int = 90;
+const CH_LOWER_DELTA: int = 32;
+
+// Where the header block ends: the offset just past CRLFCRLF, or a HEAD_*
+// code. Also accepts a bare LFLF, which some clients still emit and every
+// server still tolerates.
+export fn headEnd(buf: byte[], used: int): int {
+    let i = 0;
+    while (i < used) {
+        if (buf[i] == CH_LF) {
+            // LF LF
+            if (i + 1 < used && buf[i + 1] == CH_LF) { return i + 2; }
+            // LF CR LF
+            if (i + 2 < used && buf[i + 1] == CH_CR && buf[i + 2] == CH_LF) { return i + 3; }
+        }
+        i += 1;
+    }
+    if (used >= MAX_HEAD) { return HEAD_TOO_LARGE; }
+    return HEAD_INCOMPLETE;
+}
+
+// The value of the Host header, lowercased, or "" when there isn't a usable
+// one.
+//
+// Scanning is line by line over the raw bytes with no allocation until a match
+// is found, because this runs once per connection on the hot path and the
+// answer is usually in the first few lines.
+export fn hostHeader(buf: byte[], used: int): string {
+    // Skip the request line; Host is a header, and a request-line token that
+    // happened to start with "host:" would otherwise be read as one.
+    let i = lineEnd(buf, used, 0);
+    if (i < 0) { return ""; }
+
+    while (i < used) {
+        let e = lineEnd(buf, used, i);
+        if (e < 0) { return ""; }
+        let len = lineLen(buf, i, e);
+        if (len == 0) { return ""; }        // blank line: end of the block
+
+        // "Host" is four bytes, so the colon is the fifth: len must exceed 5
+        // for there to be a value after it at all.
+        if (len > 5 && matchHost(buf, i)) {
+            let v = i + 4;
+            if (buf[v] == CH_COLON) {
+                v += 1;
+                // Optional whitespace before the value.
+                while (v < i + len && (buf[v] == CH_SP || buf[v] == CH_TAB)) { v += 1; }
+                let end = i + len;
+                // ...and after it.
+                while (end > v && (buf[end - 1] == CH_SP || buf[end - 1] == CH_TAB)) { end -= 1; }
+                if (end <= v) { return ""; }
+                return lowerSlice(buf, v, end);
+            }
+        }
+        i = e;
+    }
+    return "";
+}
+
+// "host" case-insensitively at `at`. Five bytes, unrolled, no allocation.
+fn matchHost(buf: byte[], at: int): bool {
+    return lower1(buf[at])     == 104     // h
+        && lower1(buf[at + 1]) == 111     // o
+        && lower1(buf[at + 2]) == 115     // s
+        && lower1(buf[at + 3]) == 116;    // t
+}
+
+fn lower1(c: int): int {
+    if (c >= CH_A && c <= CH_Z) { return c + CH_LOWER_DELTA; }
+    return c;
+}
+
+// Offset just past the next LF at or after `lo`, or -1 if there is none.
+fn lineEnd(buf: byte[], used: int, lo: int): int {
+    let i = lo;
+    while (i < used) {
+        if (buf[i] == CH_LF) { return i + 1; }
+        i += 1;
+    }
+    return -1;
+}
+
+// Length of the line starting at `start` and ending at `e` (which is past the
+// LF), with the CRLF or LF removed.
+fn lineLen(buf: byte[], start: int, e: int): int {
+    let end = e - 1;                                    // drop the LF
+    if (end > start && buf[end - 1] == CH_CR) { end -= 1; }   // and a CR
+    return end - start;
+}
+
+// Lowercase [lo, to) into a string, refusing anything with a byte that has
+// no business in a Host header. Returns "" on refusal, which the caller turns
+// into a 400 — a Host carrying a CR, LF or NUL is a smuggling attempt, not a
+// typo, so it is never repaired into something routable.
+fn lowerSlice(buf: byte[], lo: int, to: int): string {
+    let n = to - lo;
+    if (n <= 0 || n > 260) { return ""; }
+    let out = bytes(n);
+    let i = 0;
+    while (i < n) {
+        let c = buf[lo + i];
+        if (c == CH_CR || c == CH_LF || c == CH_NUL) { return ""; }
+        out[i] = lower1(c) as byte;
+        i += 1;
+    }
+    return strbytes(out, n);
+}

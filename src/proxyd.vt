@@ -1,0 +1,450 @@
+// vyto-proxyd — the proxy itself.
+//
+// One process, one epoll loop, non-blocking throughout. No threads, because
+// Vyto has none and does not want them: a thread would force atomic
+// refcounting on every object in the program. Concurrency here is fds, not
+// threads, which is the shape vyto/net/server settled on too.
+//
+// This is deliberately NOT built on vyto/net/server. That module parses a
+// request in order to *answer* it, and its parser is private. A proxy wants
+// the opposite: read only as far as the Host header, then stop understanding
+// the stream and forward it verbatim. Building on Socket + PollSet directly is
+// both simpler and more correct here — it is what lets WebSocket upgrades and
+// unknown methods pass through untouched.
+//
+// The loop holds one Tunnel per client, indexed in a table by BOTH of its fds,
+// so a poll event on either side finds the same object in one lookup.
+
+import { Socket, PollSet, RecvResult, socket_listen_on, socket_connect_async,
+         POLL_READ, POLL_WRITE, POLL_ERR } from "vyto/net/socket";
+import { cli, Cli } from "vyto/cli";
+import { exit, getenv } from "vyto/os";
+import { monoMs } from "vyto/util/time";  // monotonic: an idle timeout must not jump when the wall clock does
+import { Table, readTable } from "vyto-proxy/src/routes";
+import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
+import { writePidFile, removePidFile } from "vyto-proxy/src/signal";
+import { headEnd, hostHeader, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+import { Tunnel, Buf, BUF_SIZE, PH_READ_HEAD, PH_CONNECTING, PH_PIPING,
+         PH_ERROR, PH_CLOSED } from "vyto-proxy/src/tunnel";
+import { badGateway, noRoute, badRequest } from "vyto-proxy/src/errors";
+
+export const VERSION: string = "0.1.0";
+
+// A connection that has said nothing for this long is dropped. Slowloris
+// defence: without it, an attacker holds a slot per idle socket for free.
+const IDLE_MS: i64 = 60000;
+// How often to sweep for those. Cheap because it walks only live slots.
+const SWEEP_MS: i64 = 5000;
+
+// Max connections. Each costs two fds and up to 128k of buffer, so the default
+// is chosen to stay inside a normal 1024-fd ulimit with room to spare.
+const MAX_CONNS: int = 256;
+
+extern "C" {
+    fn vp_ignore_sigpipe();
+    fn vp_install_hup();
+    fn vp_hup_pending(): i32;
+    fn vp_clear_hup();
+}
+
+// SIGHUP is noticed by polling a flag, not by running Vyto code in the handler.
+// A signal handler may interrupt malloc mid-lock, so allocating there can
+// deadlock. The C-level handler does nothing but set a byte; the loop reads it
+// between polls, where allocation is safe again.
+//
+// SIG_IGN on SIGPIPE is the other half: writing to a socket whose peer has gone
+// away raises SIGPIPE, which by default kills the process. A proxy has peers
+// vanish constantly, so it must see the EPIPE return value instead.
+// ---------------------------------------------------------------------------
+
+export class Proxy {
+    table: Table;
+    routes_file: string;
+    listener: Socket;
+    poll: PollSet;
+
+    // Tunnels indexed by fd. Both of a tunnel's fds point at the same object,
+    // so a ready fd resolves in one array read with no map lookup on the hot
+    // path. Sized by the fd ceiling rather than the connection count because
+    // that is what fds actually index.
+    slots: Tunnel[];
+    hi_fd: int;
+    live: int;
+
+    verbose: bool;
+    running: bool;
+    last_sweep: i64;
+
+    fn init(routes_file: string, verbose: bool) {
+        this.routes_file = routes_file;
+        this.table = new Table();
+        this.listener = null;
+        this.poll = null;
+        this.slots = [];
+        this.hi_fd = 0;
+        this.live = 0;
+        this.verbose = verbose;
+        this.running = true;
+        this.last_sweep = 0;
+    }
+
+    fn log(msg: string) { if (this.verbose) { print(msg); } }
+
+    // Load, or keep what we have.
+    //
+    // A broken routes file leaves the previous table in place and says so. The
+    // alternative — adopting an empty table — turns one typo into a total
+    // outage, which is exactly the failure a reload is supposed to avoid.
+    fn reload(): bool {
+        let t = readTable(this.routes_file);
+        if (!t.ok()) {
+            print(`vyto-proxyd: {t.err}`);
+            print("vyto-proxyd: keeping the previous table");
+            return false;
+        }
+        this.table = t;
+        this.log(`loaded {t.count()} route(s) from {this.routes_file}`);
+        return true;
+    }
+
+    fn ensureSlots(fd: int) {
+        while (this.slots.len <= fd) { this.slots.push(null); }
+    }
+
+    fn attach(fd: int, t: Tunnel) {
+        this.ensureSlots(fd);
+        this.slots[fd] = t;
+        if (fd > this.hi_fd) { this.hi_fd = fd; }
+    }
+
+    fn detach(fd: int) {
+        if (fd >= 0 && fd < this.slots.len) { this.slots[fd] = null; }
+    }
+
+    // ---- lifecycle ----
+
+    fn listen(host: string, port: int, backlog: int): bool {
+        this.listener = socket_listen_on(host, port, backlog);
+        if (this.listener == null) { return false; }
+        if (!this.listener.setNonBlocking(true)) { return false; }
+        this.poll = new PollSet();
+        return this.poll.add(this.listener, POLL_READ);
+    }
+
+    fn run() {
+        let lfd = this.listener.fd as int;
+        this.last_sweep = monoMs();
+
+        while (this.running) {
+            let n = this.poll.wait(1000);
+
+            // Signals land between polls, where allocation is safe.
+            if ((vp_hup_pending() as int) != 0) {
+                vp_clear_hup();
+                this.log("SIGHUP: reloading routes");
+                this.reload();
+            }
+
+            let now = monoMs();
+            if (n > 0) {
+                let i = 0;
+                while (i < n) {
+                    let fd = this.poll.readyFd(i);
+                    let ev = this.poll.readyEvents(i);
+                    if (fd == lfd) { this.acceptBurst(now); }
+                    else { this.service(fd, ev, now); }
+                    i += 1;
+                }
+            }
+
+            if (now - this.last_sweep >= SWEEP_MS) {
+                this.sweep(now);
+                this.last_sweep = now;
+            }
+        }
+    }
+
+    // Drain the accept queue. One wakeup can mean many pending connections, and
+    // accepting only one per wakeup gives away most of the throughput.
+    fn acceptBurst(now: i64) {
+        while (true) {
+            if (this.live >= MAX_CONNS) { return; }
+            let c = this.listener.tryAccept();
+            if (c == null) { return; }
+            c.setNoDelay(true);          // a proxy hop must not add Nagle delay
+            let t = new Tunnel(c, now);
+            let fd = c.fd as int;
+            this.attach(fd, t);
+            this.live += 1;
+            this.poll.add(c, POLL_READ);
+        }
+    }
+
+    fn service(fd: int, ev: int, now: i64) {
+        if (fd < 0 || fd >= this.slots.len) { return; }
+        let t = this.slots[fd];
+        if (t == null) { return; }
+        t.last_ms = now;
+
+        let is_front = t.front != null && (t.front.fd as int) == fd;
+
+        if (t.phase == PH_READ_HEAD) {
+            if (is_front) { this.readHead(t); }
+        } else if (t.phase == PH_CONNECTING) {
+            if (!is_front) { this.finishConnect(t); }
+        } else if (t.phase == PH_PIPING) {
+            this.pipe(t, is_front, ev);
+        } else if (t.phase == PH_ERROR) {
+            if (is_front) { this.flushError(t); }
+        }
+
+        if (t.finished()) { this.reap(t); }
+        else { this.rearm(t); }
+    }
+
+    // ---- phase: reading the head ----
+
+    fn readHead(t: Tunnel) {
+        let r = t.front.tryRecv(4096);
+        if (r.wouldBlock()) { return; }
+        if (r.status <= 0) { t.front_eof = true; t.phase = PH_CLOSED; return; }
+
+        if (!t.headAppend(r.data, r.status, MAX_HEAD)) {
+            this.fail(t, badRequest());
+            return;
+        }
+
+        let e = headEnd(t.head, t.head_len);
+        if (e == HEAD_INCOMPLETE) { return; }
+        if (e == HEAD_TOO_LARGE) { this.fail(t, badRequest()); return; }
+
+        let raw = hostHeader(t.head, t.head_len);
+        if (raw.is_empty()) { this.fail(t, badRequest()); return; }
+
+        let port = this.table.lookup(raw);
+        if (port == 0) {
+            this.log(`404 {raw}`);
+            this.fail(t, noRoute(raw));
+            return;
+        }
+        t.host = raw;
+        t.port = port;
+
+        // Everything read so far — head and any body bytes that arrived with
+        // it — is what the backend must receive first.
+        t.f2b.append(t.head, t.head_len);
+        t.head = bytes(0);
+        t.head_len = 0;
+
+        this.connectBackend(t);
+    }
+
+    // ---- phase: connecting ----
+
+    fn connectBackend(t: Tunnel) {
+        let b = socket_connect_async("127.0.0.1", t.port);
+        if (b == null) { this.fail(t, badGateway(t.host, t.port)); return; }
+        b.setNoDelay(true);
+        t.back = b;
+        t.phase = PH_CONNECTING;
+        this.attach(b.fd as int, t);
+        this.poll.add(b, POLL_WRITE);
+        this.log(`{t.host} -> :{t.port}`);
+    }
+
+    fn finishConnect(t: Tunnel) {
+        if (t.back.connResult() != 0) {
+            // Refused: the route is right, the server is not there. This is the
+            // case the 502 page exists for.
+            this.log(`502 {t.host} -> :{t.port} (refused)`);
+            this.poll.remove(t.back);
+            this.detach(t.back.fd as int);
+            t.back.close();
+            t.back = null;
+            this.fail(t, badGateway(t.host, t.port));
+            return;
+        }
+        t.phase = PH_PIPING;
+    }
+
+    // ---- phase: piping ----
+
+    fn pipe(t: Tunnel, is_front: bool, ev: int) {
+        if (is_front) {
+            if ((ev & POLL_READ) != 0) { this.move(t, t.front, t.f2b, true); }
+            if ((ev & POLL_WRITE) != 0) { this.flush(t, t.front, t.b2f, true); }
+        } else {
+            if ((ev & POLL_READ) != 0) { this.move(t, t.back, t.b2f, false); }
+            if ((ev & POLL_WRITE) != 0) { this.flush(t, t.back, t.f2b, false); }
+        }
+        // A read on one side may have filled a buffer the other side can now
+        // write, so try the paired write immediately rather than waiting for
+        // another poll wakeup. This is what keeps a loopback hop at one
+        // syscall round-trip instead of two.
+        if (!t.f2b.isEmpty() && t.back != null) { this.flush(t, t.back, t.f2b, false); }
+        if (!t.b2f.isEmpty() && t.front != null) { this.flush(t, t.front, t.b2f, true); }
+    }
+
+    // src -> buf
+    fn move(t: Tunnel, s: Socket, buf: Buf, from_front: bool) {
+        if (s == null) { return; }
+        let room = buf.space();
+        if (room <= 0) { return; }
+        let want = room;
+        if (want > 32768) { want = 32768; }
+        let r = s.tryRecv(want);
+        if (r.wouldBlock()) { return; }
+        if (r.status == 0) {
+            // Clean EOF: the peer stopped talking but may still be listening.
+            if (from_front) { t.front_eof = true; } else { t.back_eof = true; }
+            return;
+        }
+        if (r.status < 0) {
+            // A read error (ECONNRESET and friends) means the peer is gone in
+            // both directions, not merely done sending.
+            if (from_front) { t.front_dead = true; } else { t.back_dead = true; }
+            return;
+        }
+        buf.append(r.data, r.status);
+    }
+
+    // buf -> dst, resuming a partial write from the offset.
+    fn flush(t: Tunnel, s: Socket, buf: Buf, to_front: bool) {
+        if (s == null) { return; }
+        while (!buf.isEmpty()) {
+            let n = buf.pending();
+            let sent = s.trySendRaw(buf.data as cstring, buf.off, n);
+            if (sent == -1) { return; }              // would block; poll will call us
+            if (sent < 0) {
+                // A failed write means this peer cannot receive anything ever
+                // again — distinct from EOF, which only means it stopped
+                // talking. Marking it dead lets finished() tear the tunnel down
+                // now rather than leaving both fds to the idle sweep.
+                if (to_front) { t.front_dead = true; } else { t.back_dead = true; }
+                return;
+            }
+            buf.off += sent;
+            if (buf.isEmpty()) { buf.compact(); return; }
+            if (sent == 0) { return; }
+        }
+    }
+
+    // ---- phase: error ----
+
+    // Abandon the backend and answer the client ourselves.
+    fn fail(t: Tunnel, response: string) {
+        t.phase = PH_ERROR;
+        t.b2f.len = 0;
+        t.b2f.off = 0;
+        let n = response.len;
+        if (n > BUF_SIZE) { n = BUF_SIZE; }
+        let i = 0;
+        while (i < n) { t.b2f.data[i] = response[i] as byte; i += 1; }
+        t.b2f.len = n;
+        this.flushError(t);
+    }
+
+    fn flushError(t: Tunnel) {
+        if (t.front == null) { return; }
+        this.flush(t, t.front, t.b2f, true);
+    }
+
+    // ---- poll re-arming ----
+
+    // Tell epoll what this tunnel currently cares about. Called after every
+    // event because the answer changes as buffers fill and drain — that is
+    // precisely how backpressure is applied.
+    fn rearm(t: Tunnel) {
+        if (t.front != null) {
+            let e = 0;
+            if (t.wantFrontRead()) { e = e | POLL_READ; }
+            if (t.wantFrontWrite()) { e = e | POLL_WRITE; }
+            this.poll.modify(t.front, e);
+        }
+        if (t.back != null && t.phase == PH_PIPING) {
+            let e = 0;
+            if (t.wantBackRead()) { e = e | POLL_READ; }
+            if (t.wantBackWrite()) { e = e | POLL_WRITE; }
+            this.poll.modify(t.back, e);
+        }
+    }
+
+    fn reap(t: Tunnel) {
+        if (t.front != null) {
+            let fd = t.front.fd as int;
+            this.poll.remove(t.front);
+            this.detach(fd);
+        }
+        if (t.back != null) {
+            let fd = t.back.fd as int;
+            this.poll.remove(t.back);
+            this.detach(fd);
+        }
+        t.close();
+        this.live -= 1;
+        if (this.live < 0) { this.live = 0; }
+    }
+
+    // Drop connections that have gone quiet. Walks live slots only.
+    fn sweep(now: i64) {
+        let fd = 0;
+        while (fd <= this.hi_fd && fd < this.slots.len) {
+            let t = this.slots[fd];
+            if (t != null && t.front != null && (t.front.fd as int) == fd) {
+                if (now - t.last_ms > IDLE_MS) { this.reap(t); }
+            }
+            fd += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+fn main() {
+    let app = new Cli("vyto-proxyd", "route domains to local ports");
+    app.intOption("port", "port to listen on").short("p").meta("PORT").dfltInt(80);
+    app.option("host", "address to bind").meta("ADDR").dflt("0.0.0.0");
+    app.option("routes", "routes file to read").meta("PATH");
+    app.flag("verbose", "log every routing decision").short("v");
+    app.flag("version", "print the version and exit");
+
+    if (!app.parse(args())) { print(app.report()); exit(app.exitCode()); }
+    if (app.helpWanted()) { print(app.usage()); return; }
+    if (app.on("version")) { print("vyto-proxyd " + VERSION); return; }
+
+    if (!ensureStateDir()) {
+        print(`vyto-proxyd: cannot create {stateDir()}`);
+        exit(1);
+    }
+
+    let rf = app.get("routes");
+    if (rf.is_empty()) { rf = routesPath(); }
+
+    let p = new Proxy(rf, app.on("verbose"));
+    if (!p.reload()) { exit(1); }
+
+    // SIGPIPE would otherwise kill us the first time a client hangs up
+    // mid-response; SIGHUP is our reload.
+    vp_ignore_sigpipe();
+    vp_install_hup();
+
+    let port = app.getInt("port");
+    let host = app.get("host");
+    if (!p.listen(host, port, 512)) {
+        print(`vyto-proxyd: cannot listen on {host}:{port}`);
+        if (port < 1024) {
+            print("  ports below 1024 need privilege. Grant it once with:");
+            print("    sudo setcap cap_net_bind_service=+ep ./vyto-proxyd");
+        }
+        exit(1);
+    }
+
+    if (!writePidFile(pidPath())) {
+        print(`vyto-proxyd: cannot write {pidPath()}`);
+        exit(1);
+    }
+
+    print(`vyto-proxyd listening on {host}:{port} — {p.table.count()} route(s)`);
+    p.run();
+    removePidFile(pidPath());
+}

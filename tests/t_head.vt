@@ -1,0 +1,62 @@
+import { headEnd, hostHeader, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+
+fn b(s: string): byte[] { return strbytes_of(s); }
+
+fn strbytes_of(s: string): byte[] {
+    let out = bytes(s.len);
+    let i = 0;
+    while (i < s.len) { out[i] = s[i] as byte; i += 1; }
+    return out;
+}
+
+fn checks(label: string, got: string, want: string) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got "{got}", want "{want}"`);
+}
+
+fn check(label: string, got: int, want: int) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got {got}, want {want}`);
+}
+
+fn main() {
+    let req = b("GET / HTTP/1.1\r\nHost: www.example.com\r\nAccept: */*\r\n\r\n");
+    check("headEnd finds CRLFCRLF", headEnd(req, req.len), req.len);
+    checks("host extracted", hostHeader(req, req.len), "www.example.com");
+
+    let mixed = b("GET / HTTP/1.1\r\nHOST:   Example.COM   \r\n\r\n");
+    checks("host case and space normalized", hostHeader(mixed, mixed.len), "example.com");
+
+    let lf = b("GET / HTTP/1.1\nHost: a.com\n\n");
+    check("bare LFLF accepted", headEnd(lf, lf.len), lf.len);
+    checks("host from LF request", hostHeader(lf, lf.len), "a.com");
+
+    let partial = b("GET / HTTP/1.1\r\nHost: a.com\r\n");
+    check("incomplete head", headEnd(partial, partial.len), HEAD_INCOMPLETE);
+
+    let nohost = b("GET / HTTP/1.1\r\nAccept: */*\r\n\r\n");
+    checks("no host header", hostHeader(nohost, nohost.len), "");
+
+    let porty = b("GET / HTTP/1.1\r\nHost: a.com:8443\r\n\r\n");
+    checks("host keeps its port for the caller to strip", hostHeader(porty, porty.len), "a.com:8443");
+
+    // A request-line token starting with "host" must not be mistaken for the
+    // header.
+    let tricky = b("GET /host:evil.com HTTP/1.1\r\nHost: real.com\r\n\r\n");
+    checks("request line is skipped", hostHeader(tricky, tricky.len), "real.com");
+
+    // A NUL in the value is a smuggling attempt, not a typo.
+    let nul = bytes(40);
+    let pre = b("GET / HTTP/1.1\r\nHost: a\x00b.com\r\n\r\n");
+    checks("NUL in host is refused", hostHeader(pre, pre.len), "");
+
+    let big = bytes(MAX_HEAD + 10);
+    let i = 0;
+    while (i < big.len) { big[i] = 65 as byte; i += 1; }
+    check("oversize head refused", headEnd(big, big.len), HEAD_TOO_LARGE);
+
+    // Folded/continued header lines are legal-ish but obsolete; we just need
+    // not to crash or mis-read them.
+    let folded = b("GET / HTTP/1.1\r\nX-Long: a\r\n b\r\nHost: f.com\r\n\r\n");
+    checks("host after a folded header", hostHeader(folded, folded.len), "f.com");
+}

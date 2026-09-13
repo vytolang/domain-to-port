@@ -1,0 +1,193 @@
+// One proxied connection: a client socket, a backend socket, and the bytes in
+// flight between them.
+//
+// The lifecycle is a small state machine because the interesting part of a
+// proxy is not copying bytes, it is what to do when one side is slower than the
+// other. Every phase below exists because something can block there.
+//
+//   READ_HEAD   reading the client's header block, looking for Host
+//   CONNECTING  backend connect() is in flight (non-blocking)
+//   PIPING      both sides open; pure bytes, no parsing
+//   ERROR       writing our own response (a 502 or 400), then closing
+//   CLOSED      both fds released
+//
+// The single rule that keeps memory bounded: a direction stops *reading* when
+// its outbound buffer is full, so a fast backend cannot make us hold megabytes
+// on behalf of a slow client. That is `wantRead()` below, and it is the reason
+// the buffers are fixed-size rather than a growing StringBuilder.
+
+import { Socket } from "vyto/net/socket";
+
+export const PH_READ_HEAD:  int = 0;
+export const PH_CONNECTING: int = 1;
+export const PH_PIPING:     int = 2;
+export const PH_ERROR:      int = 3;
+export const PH_CLOSED:     int = 4;
+
+// Per-direction buffer size. 64k is two full TCP windows on a loopback hop and
+// the point past which more buffer stops buying throughput and starts buying
+// latency — bytes sat in our buffer are bytes the kernel could not pace.
+export const BUF_SIZE: int = 65536;
+
+// A fixed-size byte buffer with a read cursor, so a partial write resumes
+// where it stopped instead of re-slicing the remainder.
+export class Buf {
+    data: byte[];
+    len: int;       // bytes held
+    off: int;       // bytes already written out
+
+    fn init() {
+        this.data = bytes(BUF_SIZE);
+        this.len = 0;
+        this.off = 0;
+    }
+
+    fn pending(): int { return this.len - this.off; }
+    fn isEmpty(): bool { return this.off >= this.len; }
+    fn space(): int { return BUF_SIZE - this.len; }
+    fn isFull(): bool { return this.len >= BUF_SIZE; }
+
+    // Drop what has been written and slide the rest down. Called once a write
+    // drains the buffer, so the common case is a reset rather than a memmove.
+    fn compact() {
+        if (this.off == 0) { return; }
+        if (this.off >= this.len) { this.len = 0; this.off = 0; return; }
+        let n = this.len - this.off;
+        let i = 0;
+        while (i < n) { this.data[i] = this.data[this.off + i]; i += 1; }
+        this.len = n;
+        this.off = 0;
+    }
+
+    // Append, returning how much fit.
+    fn append(src: byte[], n: int): int {
+        let room = this.space();
+        let take = n;
+        if (take > room) { take = room; }
+        let i = 0;
+        while (i < take) { this.data[this.len + i] = src[i]; i += 1; }
+        this.len += take;
+        return take;
+    }
+}
+
+// A client connection and everything owed to it.
+export class Tunnel {
+    front: Socket;          // the client
+    back: Socket;           // the backend; null until a route is chosen
+    phase: int;
+
+    head: byte[];           // client bytes before the header block ended
+    head_len: int;
+
+    f2b: Buf;               // client -> backend
+    b2f: Buf;               // backend -> client
+
+    host: string;           // the Host we routed on, for logging
+    port: int;              // the backend port we chose
+
+    front_eof: bool;        // client half-closed (sent FIN; may still be reading)
+    back_eof: bool;         // backend half-closed
+    front_dead: bool;       // client is UNREACHABLE: a write to it failed
+    back_dead: bool;        // backend is unreachable
+
+    last_ms: i64;           // last activity, for the idle sweep
+
+    fn init(front: Socket, now: i64) {
+        this.front = front;
+        this.back = null;
+        this.phase = PH_READ_HEAD;
+        this.head = bytes(1024);      // grows to MAX_HEAD only if needed
+        this.head_len = 0;
+        this.f2b = new Buf();
+        this.b2f = new Buf();
+        this.host = "";
+        this.port = 0;
+        this.front_eof = false;
+        this.back_eof = false;
+        this.front_dead = false;
+        this.back_dead = false;
+        this.last_ms = now;
+    }
+
+    // Room for `n` more head bytes, growing to the cap. Starting at 1k and
+    // doubling means the common request costs one small allocation, not a 16k
+    // one per connection.
+    fn headReserve(n: int, cap: int): bool {
+        let need = this.head_len + n;
+        if (need <= this.head.len) { return true; }
+        if (need > cap) { return false; }
+        let sz = this.head.len;
+        while (sz < need) { sz = sz * 2; }
+        if (sz > cap) { sz = cap; }
+        let nb = bytes(sz);
+        let i = 0;
+        while (i < this.head_len) { nb[i] = this.head[i]; i += 1; }
+        this.head = nb;
+        return true;
+    }
+
+    fn headAppend(src: byte[], n: int, cap: int): bool {
+        if (!this.headReserve(n, cap)) { return false; }
+        let i = 0;
+        while (i < n) { this.head[this.head_len + i] = src[i]; i += 1; }
+        this.head_len += n;
+        return true;
+    }
+
+    // Should we be watching the client for readable data? No once it has
+    // half-closed, and no while the buffer it feeds is full — that is the
+    // backpressure that bounds memory.
+    fn wantFrontRead(): bool {
+        if (this.front_eof || this.front_dead || this.back_dead) { return false; }
+        if (this.phase == PH_READ_HEAD) { return true; }
+        if (this.phase != PH_PIPING) { return false; }
+        return !this.f2b.isFull();
+    }
+
+    fn wantBackRead(): bool {
+        if (this.phase != PH_PIPING) { return false; }
+        if (this.back_eof || this.back_dead || this.front_dead) { return false; }
+        return !this.b2f.isFull();
+    }
+
+    fn wantFrontWrite(): bool { return !this.front_dead && !this.b2f.isEmpty(); }
+    fn wantBackWrite(): bool  { return !this.back_dead && !this.f2b.isEmpty(); }
+
+    // Done when neither side can make progress: both directions drained and at
+    // least one peer has gone away.
+    // Done when nothing more can usefully happen.
+    //
+    // The distinction that matters here is between a peer that half-closed and
+    // one that is gone. A client which sends FIN after its request is being
+    // polite — it still wants the response, so the tunnel must stay open. A
+    // client whose socket rejected a write is unreachable, and then continuing
+    // to pull from the backend serves nobody: those bytes have no destination.
+    //
+    // Getting this wrong does not leak memory, it leaks *sockets* — the tunnel
+    // survives to the idle sweep holding an fd at each end, which under a load
+    // of abandoned downloads is how a proxy runs out of descriptors.
+    fn finished(): bool {
+        if (this.phase == PH_CLOSED) { return true; }
+        if (this.phase == PH_ERROR) { return this.b2f.isEmpty() || this.front_dead; }
+        if (this.phase != PH_PIPING) { return false; }
+
+        // Either peer unreachable: nothing left to deliver in either direction.
+        if (this.front_dead || this.back_dead) { return true; }
+
+        // Both sides finished speaking and every buffer has drained.
+        if (this.front_eof && this.back_eof && this.f2b.isEmpty() && this.b2f.isEmpty()) { return true; }
+
+        // The backend finished its response and the client has it. Waiting on a
+        // client FIN here would hold the tunnel for the whole of a keep-alive
+        // idle period after the exchange is over.
+        if (this.back_eof && this.b2f.isEmpty() && this.front_eof && this.f2b.isEmpty()) { return true; }
+        return false;
+    }
+
+    fn close() {
+        if (this.front != null) { this.front.close(); this.front = null; }
+        if (this.back != null) { this.back.close(); this.back = null; }
+        this.phase = PH_CLOSED;
+    }
+}

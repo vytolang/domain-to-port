@@ -1,0 +1,66 @@
+import { Table, normalize, readTable, writeTable, valid_port } from "vyto-proxy/src/routes";
+
+fn check(label: string, got: int, want: int) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got {got}, want {want}`);
+}
+
+fn checks(label: string, got: string, want: string) {
+    if (got == want) { print(`ok   {label}`); return; }
+    print(`FAIL {label}: got "{got}", want "{want}"`);
+}
+
+fn main() {
+    checks("normalize lowercases", normalize("WWW.Example.COM"), "www.example.com");
+    checks("normalize strips port", normalize("example.com:8080"), "example.com");
+    checks("normalize strips wildcard", normalize("*.dev.local"), "dev.local");
+    checks("normalize strips trailing dot", normalize("example.com."), "example.com");
+    checks("normalize rejects junk", normalize("ex ample.com"), "");
+    checks("normalize rejects empty", normalize(""), "");
+
+    let t = new Table();
+    t.put("www.example.com", 8099);
+    t.put("*.dev.local", 3000);
+    t.put("*.a.dev.local", 4000);
+
+    check("exact hit", t.lookup("www.example.com"), 8099);
+    check("exact hit, odd case", t.lookup("WWW.EXAMPLE.COM"), 8099);
+    check("exact hit with port", t.lookup("www.example.com:80"), 8099);
+    check("miss", t.lookup("nope.com"), 0);
+    check("wildcard hit", t.lookup("x.dev.local"), 3000);
+    check("longest wildcard wins", t.lookup("q.a.dev.local"), 4000);
+    check("wildcard excludes bare", t.lookup("dev.local"), 0);
+    check("count", t.count(), 3);
+
+    t.put("www.example.com", 9000);
+    check("put replaces", t.lookup("www.example.com"), 9000);
+    check("put replace keeps count", t.count(), 3);
+
+    if (t.remove("*.dev.local")) { print("ok   remove wildcard"); }
+    else { print("FAIL remove wildcard"); }
+    check("removed wildcard is gone", t.lookup("x.dev.local"), 0);
+    check("sibling wildcard survives", t.lookup("q.a.dev.local"), 4000);
+
+    if (!t.remove("never.there")) { print("ok   remove miss returns false"); }
+    else { print("FAIL remove miss returns false"); }
+
+    if (!valid_port(0) && !valid_port(65536) && valid_port(80)) { print("ok   valid_port"); }
+    else { print("FAIL valid_port"); }
+
+    let path = "tests/tmp/routes.json";
+    if (writeTable(path, t)) { print("ok   writeTable"); } else { print("FAIL writeTable"); }
+    let back = readTable(path);
+    if (back.ok()) { print("ok   readTable parses"); } else { print(`FAIL readTable: {back.err}`); }
+    check("roundtrip exact", back.lookup("www.example.com"), 9000);
+    check("roundtrip wildcard", back.lookup("q.a.dev.local"), 4000);
+    check("roundtrip count", back.count(), 2);
+
+    let missing = readTable("tests/tmp/definitely-not-here.json");
+    if (missing.ok() && missing.count() == 0) { print("ok   missing file is empty, not an error"); }
+    else { print("FAIL missing file"); }
+
+    writefile("tests/tmp/bad.json", "{ not json");
+    let bad = readTable("tests/tmp/bad.json");
+    if (!bad.ok()) { print("ok   bad JSON reports an error"); }
+    else { print("FAIL bad JSON reports an error"); }
+}

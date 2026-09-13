@@ -1,0 +1,27 @@
+// Where the state lives.
+//
+// One place, because two binaries have to agree on it and a mismatch shows up
+// as "the CLI says the route is there and the proxy disagrees" — the most
+// confusing failure this tool could have.
+//
+// The state dir is $VYTO_PROXY_HOME, else $XDG_STATE_HOME/vyto-proxy, else
+// ~/.local/state/vyto-proxy. A system install overrides it to /var/lib via the
+// env var rather than through a second code path.
+
+import { getenv, homeDir } from "vyto/os";
+import { path_join, file_mkdirs } from "vyto/io/file";
+
+export fn stateDir(): string {
+    let h = getenv("VYTO_PROXY_HOME");
+    if (!h.is_empty()) { return h; }
+    let xdg = getenv("XDG_STATE_HOME");
+    if (!xdg.is_empty()) { return path_join(xdg, "vyto-proxy"); }
+    return path_join(path_join(homeDir(), ".local/state"), "vyto-proxy");
+}
+
+// Create the state dir if absent. Both binaries call this before touching a
+// path, so a first run on a clean machine needs no setup step.
+export fn ensureStateDir(): bool { return file_mkdirs(stateDir()); }
+
+export fn routesPath(): string { return path_join(stateDir(), "routes.json"); }
+export fn pidPath(): string { return path_join(stateDir(), "vyto-proxyd.pid"); }

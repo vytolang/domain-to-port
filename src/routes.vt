@@ -1,0 +1,274 @@
+// The domain -> port table, and the file it lives in.
+//
+// Shared by both binaries: `domain-to-port` edits it, `vyto-proxyd` reads it on
+// every SIGHUP. That sharing is the reason the format is dull. It is JSON, the
+// same choice vytopack made for vyto.json, because a human edits this by hand
+// when the CLI is not to hand and a format with no quoting rules to remember
+// loses less time than one with a prettier diff.
+//
+// A route is a domain and a port. There is deliberately no backend *host*
+// field: this proxy exists to put pretty names in front of things already
+// listening on localhost, and a table that could point at another machine
+// would need a whole trust story it does not have yet. See PROXY.md §"Not
+// doing".
+
+import { json_parse, jobj, jarr, jstr, jint, JsonValue } from "vyto/util/json";
+import { file_exists, file_rename } from "vyto/io/file";
+
+export const ROUTES_FILE: string = "routes.json";
+
+// One mapping. `domain` is stored already lowercased and already stripped of
+// any leading "*." — `wild` records which it was, so matching never re-parses.
+export class Route {
+    domain: string;     // "www.example.com", or "dev.local" when wild
+    port: int;
+    wild: bool;         // came in as "*.dev.local"
+
+    fn init(domain: string, port: int, wild: bool) {
+        this.domain = domain;
+        this.port = port;
+        this.wild = wild;
+    }
+
+    // Round-trips back to what the user typed.
+    fn display(): string {
+        if (this.wild) { return "*." + this.domain; }
+        return this.domain;
+    }
+}
+
+// A parsed table, ready to answer lookups.
+//
+// Exact matches live in a Map and wildcards in an array sorted longest-first.
+// That split is the whole performance story: exact names are the common case
+// and are O(1), while wildcards are walked — which is fine because a table with
+// more than a handful of wildcards is a table that wants a different tool.
+export class Table {
+    exact: Map<string, int>;
+    wilds: Route[];         // longest domain first
+    err: string;            // non-empty when the file could not be used
+
+    fn init() {
+        this.exact = new Map<string, int>();
+        this.wilds = [];
+        this.err = "";
+    }
+
+    fn ok(): bool { return this.err.is_empty(); }
+
+    // Every route, exact then wildcard, for `domain-to-port list`.
+    fn all(): Route[] {
+        let out: Route[] = [];
+        for (let k in this.exact.keys()) {
+            out.push(new Route(k, this.exact.get(k), false));
+        }
+        for (let w in this.wilds) { out.push(w); }
+        return out;
+    }
+
+    fn count(): int { return this.exact.keys().len + this.wilds.len; }
+
+    // Add or replace. Returns false only for a domain that cannot be used.
+    fn put(raw: string, port: int): bool {
+        let d = normalize(raw);
+        if (d.is_empty()) { return false; }
+        if (is_wild(raw)) {
+            let bare = d;
+            let i = 0;
+            while (i < this.wilds.len) {
+                if (this.wilds[i].domain == bare) {
+                    this.wilds[i].port = port;
+                    return true;
+                }
+                i += 1;
+            }
+            this.wilds.push(new Route(bare, port, true));
+            this.sort_wilds();
+            return true;
+        }
+        this.exact.set(d, port);
+        return true;
+    }
+
+    // Remove by the name as typed. False when there was nothing to remove.
+    fn remove(raw: string): bool {
+        let d = normalize(raw);
+        if (d.is_empty()) { return false; }
+        if (is_wild(raw)) {
+            let i = 0;
+            while (i < this.wilds.len) {
+                if (this.wilds[i].domain == d) {
+                    this.wilds.remove_at(i);
+                    return true;
+                }
+                i += 1;
+            }
+            return false;
+        }
+        if (!this.exact.has(d)) { return false; }
+        this.exact.remove(d);
+        return true;
+    }
+
+    // The port for a Host header value, or 0 when nothing matches.
+    //
+    // `host` arrives straight off the wire, so it is lowercased and has any
+    // ":port" suffix removed here rather than at every call site.
+    fn lookup(host: string): int {
+        let h = normalize(host);
+        if (h.is_empty()) { return 0; }
+        if (this.exact.has(h)) { return this.exact.get(h); }
+
+        // Longest first, so *.a.dev.local wins over *.dev.local for
+        // "x.a.dev.local". A wildcard matches strict subdomains only: the
+        // bare "dev.local" does NOT match "*.dev.local", matching how every
+        // other proxy reads it and how a certificate's wildcard SAN works.
+        for (let w in this.wilds) {
+            if (h.len > w.domain.len + 1
+                && h.ends_with("." + w.domain)) {
+                return w.port;
+            }
+        }
+        return 0;
+    }
+
+    fn sort_wilds() {
+        // Insertion sort, descending by domain length. The list is tiny by
+        // construction and this keeps the comparison obvious.
+        let i = 1;
+        while (i < this.wilds.len) {
+            let cur = this.wilds[i];
+            let j = i - 1;
+            while (j >= 0 && this.wilds[j].domain.len < cur.domain.len) {
+                this.wilds[j + 1] = this.wilds[j];
+                j -= 1;
+            }
+            this.wilds[j + 1] = cur;
+            i += 1;
+        }
+    }
+}
+
+// ---- domain hygiene -------------------------------------------------------
+
+// Byte values used by normalize(). Vyto has no character literal, so the bytes
+// a parser compares against are named constants — the same shape the HTTP
+// parser in vyto/net/server uses.
+const CH_a: int = 97;
+const CH_z: int = 122;
+const CH_0: int = 48;
+const CH_9: int = 57;
+const CH_DASH: int = 45;
+const CH_DOT: int = 46;
+
+fn is_wild(raw: string): bool { return raw.starts_with("*."); }
+
+// Lowercase, drop a leading "*.", drop a trailing ":port", drop a trailing dot.
+// Returns "" for anything unusable, which is how callers detect a bad domain.
+export fn normalize(raw: string): string {
+    let s = raw.trim().to_lower();
+    if (s.starts_with("*.")) { s = s.slice(2, s.len); }
+
+    // "example.com:8080" -> "example.com". An IPv6 literal in a Host header is
+    // bracketed ("[::1]:80"), so a colon inside brackets is not a port
+    // separator — but a bracketed literal is not a domain we route anyway, so
+    // it falls out through the character check below.
+    let c = s.last_index_of(":");
+    if (c >= 0) { s = s.slice(0, c); }
+
+    if (s.ends_with(".")) { s = s.slice(0, s.len - 1); }
+    if (s.is_empty() || s.len > 253) { return ""; }
+
+    // Letters, digits, hyphen and dot only. Anything else in a Host header is
+    // either an attack or a bug, and both deserve a miss rather than a guess.
+    // Already lowercased above, so the A-Z range needs no test.
+    let i = 0;
+    while (i < s.len) {
+        let ch = s[i];
+        let okc = (ch >= CH_a && ch <= CH_z)
+               || (ch >= CH_0 && ch <= CH_9)
+               || ch == CH_DASH || ch == CH_DOT;
+        if (!okc) { return ""; }
+        i += 1;
+    }
+    return s;
+}
+
+// True when a port can actually be listened on by a dev server.
+export fn valid_port(p: int): bool { return p > 0 && p < 65536; }
+
+// ---- file I/O -------------------------------------------------------------
+
+// Read the table. A missing file is an empty table, not an error: a proxy with
+// no routes yet is a normal state on first run.
+//
+// A file that exists but is broken IS an error, reported through `err` and with
+// the table left empty. The daemon keeps serving its previous table in that
+// case — see reload() in proxyd.vt — so a typo never takes the proxy down.
+export fn readTable(path: string): Table {
+    let t = new Table();
+    if (!file_exists(path)) { return t; }
+
+    let root = json_parse(readfile(path));
+    if (!root.parseError().is_empty()) {
+        t.err = ROUTES_FILE + " is not valid JSON: " + root.parseError();
+        return t;
+    }
+    if (!root.isObj() || !root.has("routes")) {
+        t.err = ROUTES_FILE + " must be an object with a \"routes\" array";
+        return t;
+    }
+    let arr = root.get("routes");
+    if (!arr.isArr()) {
+        t.err = ROUTES_FILE + ": \"routes\" must be an array";
+        return t;
+    }
+
+    let i = 0;
+    while (i < arr.len()) {
+        let e = arr.at(i);
+        if (!e.isObj() || !e.has("domain") || !e.has("port")) {
+            t.err = `{ROUTES_FILE}: route {i} needs a "domain" and a "port"`;
+            return t;
+        }
+        let d = e.get("domain");
+        let p = e.get("port");
+        if (!d.isStr() || !p.isNum()) {
+            t.err = `{ROUTES_FILE}: route {i} has the wrong types`;
+            return t;
+        }
+        let port = p.asInt();
+        if (!valid_port(port)) {
+            t.err = `{ROUTES_FILE}: route {i} has port {port}, outside 1-65535`;
+            return t;
+        }
+        if (!t.put(d.asString(), port)) {
+            t.err = `{ROUTES_FILE}: route {i} has an unusable domain`;
+            return t;
+        }
+        i += 1;
+    }
+    return t;
+}
+
+// Write the table back.
+//
+// Writes a temp file and renames over the target, so a daemon reading the file
+// at the same moment sees either the old table or the new one and never a
+// half-written one. The rename is atomic within a directory, which is why the
+// temp file is a sibling rather than somewhere in /tmp.
+export fn writeTable(path: string, t: Table): bool {
+    let root = jobj();
+    let arr = jarr();
+    for (let r in t.all()) {
+        let e = jobj();
+        e.set("domain", jstr(r.display()));
+        e.set("port", jint(r.port));
+        arr.append(e);
+    }
+    root.set("routes", arr);
+
+    let tmp = path + ".tmp";
+    if (!writefile(tmp, root.stringifyPretty() + "\n")) { return false; }
+    return file_rename(tmp, path);
+}

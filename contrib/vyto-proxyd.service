@@ -1,0 +1,28 @@
+# User unit: systemctl --user enable --now vyto-proxyd
+#
+# Runs as you, not root. Binding :80 still needs the capability granted once on
+# the binary:
+#     sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
+#
+# Note setcap is attached to the file, so it must be re-granted after every
+# reinstall that replaces the binary.
+
+[Unit]
+Description=vyto-proxy — domain to local port
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/vyto-proxyd
+# The CLI's SIGHUP arrives here; systemd needs no part in a reload.
+Restart=on-failure
+RestartSec=2
+
+# The daemon needs its state dir and nothing else.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/vyto-proxy
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

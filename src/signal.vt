@@ -1,0 +1,77 @@
+// Talking to a running daemon.
+//
+// The CLI edits routes.json and then tells the daemon to re-read it. That is
+// SIGHUP and a pidfile — the oldest arrangement there is, chosen because the
+// alternative (a control socket) is a second listener, a wire format and a
+// second way in, to deliver one bit of information.
+//
+// kill(pid, 0) is the liveness probe: it performs all the permission checks and
+// delivers nothing, so it distinguishes "running" from "stale pidfile" without
+// disturbing a live process.
+
+import { file_exists, file_remove } from "vyto/io/file";
+
+extern "C" {
+    fn kill(pid: i32, sig: i32): i32;
+    fn getpid(): i32;
+}
+
+export const SIG_NONE: int = 0;
+export const SIGHUP:   int = 1;
+export const SIGTERM:  int = 15;
+
+// Outcomes of trying to reach the daemon. The CLI turns each into different
+// advice, so they stay distinct rather than collapsing into a bool.
+export const REACH_OK:       int = 0;   // signal delivered
+export const REACH_NO_FILE:  int = 1;   // no pidfile: not running
+export const REACH_STALE:    int = 2;   // pidfile points at nothing alive
+export const REACH_DENIED:   int = 3;   // alive, but not ours to signal
+export const REACH_BAD_FILE: int = 4;   // pidfile unreadable or not a number
+
+export fn writePidFile(path: string): bool {
+    return writefile(path, str(getpid() as int) + "\n");
+}
+
+export fn removePidFile(path: string) {
+    if (file_exists(path)) { file_remove(path); }
+}
+
+// The pid in the file, or 0 when there isn't a usable one.
+export fn readPid(path: string): int {
+    if (!file_exists(path)) { return 0; }
+    let txt = readfile(path).trim();
+    if (txt.is_empty()) { return 0; }
+    let n = 0;
+    let i = 0;
+    while (i < txt.len) {
+        let d = txt[i] - 48;    // '0'
+        if (d < 0 || d > 9) { return 0; }
+        n = n * 10 + d;
+        i += 1;
+    }
+    if (n <= 1) { return 0; }   // pid 1 is never our daemon
+    return n;
+}
+
+// Is that pid alive and ours to signal?
+export fn alive(pid: int): bool {
+    if (pid <= 0) { return false; }
+    return (kill(pid as i32, SIG_NONE as i32) as int) == 0;
+}
+
+// Send `sig` to the daemon named by the pidfile. Returns a REACH_* code.
+//
+// A stale pidfile is removed on the way through: it is a leftover from a
+// crashed daemon and leaving it makes every later run re-diagnose the same
+// corpse.
+export fn signalDaemon(pidPath: string, sig: int): int {
+    if (!file_exists(pidPath)) { return REACH_NO_FILE; }
+    let pid = readPid(pidPath);
+    if (pid == 0) { return REACH_BAD_FILE; }
+    if (!alive(pid)) {
+        file_remove(pidPath);
+        return REACH_STALE;
+    }
+    if ((kill(pid as i32, sig as i32) as int) != 0) { return REACH_DENIED; }
+    return REACH_OK;
+}

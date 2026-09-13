@@ -1,0 +1,75 @@
+// The pages the proxy serves when it cannot reach a backend.
+//
+// These exist because the alternative — dropping the connection — tells the
+// developer nothing. The single most common state of this tool is "route
+// points at a dev server that isn't running right now", and a page that names
+// the domain and the port turns a confusing browser error into an obvious one.
+//
+// They are deliberately plain: no external CSS, no fonts, nothing that makes a
+// second request. A page served when the network is already misbehaving must
+// not itself depend on the network.
+
+fn page(status: int, title: string, heading: string, detail: string, hint: string): string {
+    let body = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>{status} {title}</title>
+<style>
+  body {{ background: #14161a; color: #e6e8eb; margin: 0;
+         font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; padding: 24px; box-sizing: border-box; }}
+  main {{ max-width: 34rem; }}
+  h1 {{ font-size: 1.05rem; font-weight: 600; margin: 0 0 .75rem; color: #ff8f6b; }}
+  p {{ margin: 0 0 .75rem; }}
+  code {{ background: #1e2127; border-radius: 4px; padding: .15em .4em; }}
+  .hint {{ color: #9aa3ad; border-top: 1px solid #272b32; padding-top: .75rem; margin-top: 1rem; }}
+</style>
+<main>
+  <h1>{status} &middot; {heading}</h1>
+  <p>{detail}</p>
+  <p class="hint">{hint}</p>
+</main>
+</html>
+`;
+    // Built by concatenation, not as one template literal: a template does NOT
+    // process backslash escapes, so a "\r\n" written inside one is a literal
+    // backslash-r and the response framing silently breaks.
+    let crlf = "\r\n";
+    return "HTTP/1.1 " + str(status) + " " + title + crlf
+         + "Content-Type: text/html; charset=utf-8" + crlf
+         + "Content-Length: " + str(body.len) + crlf
+         + "Connection: close" + crlf
+         + crlf
+         + body;
+}
+
+// The route exists but nothing is listening on the port it names.
+export fn badGateway(host: string, port: int): string {
+    return page(502, "Bad Gateway", "nothing is listening",
+        `<code>{host}</code> is routed to <code>127.0.0.1:{port}</code>, but the connection was refused.`,
+        `Start the server on port {port}, or repoint the route: <code>domain-to-port -d {host} -p &lt;port&gt;</code>`);
+}
+
+// A Host we have no route for. Distinct from 502 on purpose: 502 means "your
+// route is right and your server is down", 404 means "there is no route".
+export fn noRoute(host: string): string {
+    return page(404, "Not Found", "no route for that domain",
+        `Nothing is mapped to <code>{host}</code>.`,
+        `Add it: <code>domain-to-port -d {host} -p 8099</code>`);
+}
+
+// The client sent something we could not read a Host out of.
+export fn badRequest(): string {
+    return page(400, "Bad Request", "unreadable request",
+        "The request had no usable <code>Host</code> header.",
+        "A proxy routes on <code>Host</code>, so a request without one cannot be dispatched.");
+}
+
+// The backend accepted the connection but then went away mid-exchange, or took
+// too long to answer.
+export fn gatewayTimeout(host: string, port: int): string {
+    return page(504, "Gateway Timeout", "the backend stopped responding",
+        `<code>127.0.0.1:{port}</code> accepted the connection for <code>{host}</code> but did not finish the exchange.`,
+        "The server may have crashed or hung while handling the request.");
+}
