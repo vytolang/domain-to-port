@@ -10,9 +10,9 @@ That is the whole interface. The route is live before the command returns — no
 restart, no config reload dance, no dropped connections.
 
 Two binaries: `domain-to-port` is the command above, and `vyto-proxyd` is the
-daemon that does the routing. A 194 KB daemon that links libc and OpenSSL and
-nothing else — a reverse proxy with the parts you actually use on a dev machine
-and none of the parts you don't.
+daemon that does the routing. The daemon is 194 KB and links libc, OpenSSL and
+libcurl — a reverse proxy with the parts you actually use on a dev machine and
+none of the parts you don't.
 
 ## Install
 
@@ -26,8 +26,8 @@ sudo install -m 755 domain-to-port vyto-proxyd /usr/local/bin/
 sudo setcap cap_net_bind_service=+ep /usr/local/bin/vyto-proxyd
 ```
 
-Needs glibc 2.35+ and OpenSSL 3.x, which means Ubuntu 22.04+, Debian 12+,
-Fedora 36+ or anything newer. Check a release's `.sha256` before trusting the
+Needs glibc 2.35+, OpenSSL 3.x and libcurl — Ubuntu 22.04+, Debian 12+,
+Fedora 36+ or anything newer ships all three. Check a release's `.sha256` before trusting the
 download.
 
 ### From source

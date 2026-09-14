@@ -64,7 +64,7 @@ jobs:
           ldd vyto-proxyd >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             vytoapps/domain-to-port/dist/*.tar.gz
@@ -79,7 +79,7 @@ jobs:
             sudo setcap cap_net_bind_service=+ep /usr/local/bin/vyto-proxyd
             ```
 
-            Needs glibc 2.35+ and OpenSSL 3.x — Ubuntu 22.04+, Debian 12+,
-            Fedora 36+. On anything older, build from source.
+            Needs glibc 2.35+, OpenSSL 3.x and libcurl — Ubuntu 22.04+,
+            Debian 12+, Fedora 36+. On anything older, build from source.
 
             Verify the download with `sha256sum -c domain-to-port-*.tar.gz.sha256`.
