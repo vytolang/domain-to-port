@@ -1,4 +1,4 @@
-# vyto-proxy
+# domain-to-port
 
 Map a domain to a local port. Instantly.
 
@@ -9,9 +9,10 @@ domain-to-port -d www.example.com -p 8099
 That is the whole interface. The route is live before the command returns — no
 restart, no config reload dance, no dropped connections.
 
-A 194 KB daemon that links libc and OpenSSL, and nothing else. It is a reverse
-proxy with the parts you actually use on a dev machine and none of the parts
-you don't.
+Two binaries: `domain-to-port` is the command above, and `vyto-proxyd` is the
+daemon that does the routing. A 194 KB daemon that links libc and OpenSSL and
+nothing else — a reverse proxy with the parts you actually use on a dev machine
+and none of the parts you don't.
 
 ## Install
 
