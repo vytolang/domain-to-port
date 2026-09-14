@@ -1,4 +1,4 @@
-import { rebuild, ourDomain, HostsResult, MARK, LOOPBACK } from "vyto-proxy/src/hosts";
+import { rebuild, ourDomain, HostsResult, MARK, LOOPBACK } from "domain-to-port/src/hosts";
 
 fn checks(label: string, got: string, want: string) {
     if (got == want) { print(`ok   {label}`); return; }

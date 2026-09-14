@@ -1,4 +1,4 @@
-import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
+import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "domain-to-port/src/head";
 
 fn b(s: string): byte[] { return strbytes_of(s); }
 

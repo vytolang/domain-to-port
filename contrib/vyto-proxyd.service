@@ -1,11 +1,18 @@
-# User unit: systemctl --user enable --now vyto-proxyd
+# User unit, for a daemon installed under ~/.local/bin:
+#
+#     cp contrib/vyto-proxyd.service ~/.config/systemd/user/
+#     systemctl --user enable --now vyto-proxyd
+#
+# Installed somewhere else — /usr/local/bin, as the prebuilt tarball suggests —
+# change ExecStart to match. There is no search path in a unit file.
 #
 # Runs as you, not root. Binding :80 still needs the capability granted once on
 # the binary:
 #     sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
 #
-# Note setcap is attached to the file, so it must be re-granted after every
-# reinstall that replaces the binary.
+# setcap is attached to the file, so it must be re-granted after every upgrade
+# that replaces the binary — including one done by unpacking a new tarball over
+# the old one.
 
 [Unit]
 Description=vyto-proxy — domain to local port
@@ -13,6 +20,7 @@ After=network.target
 
 [Service]
 ExecStart=%h/.local/bin/vyto-proxyd
+# ExecStart=/usr/local/bin/vyto-proxyd    # if installed system-wide
 # The CLI's SIGHUP arrives here; systemd needs no part in a reload.
 Restart=on-failure
 RestartSec=2

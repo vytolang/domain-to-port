@@ -9,7 +9,7 @@
 
 import { TlsContext, tls_server, ossl_available } from "vyto/crypto/openssl";
 import { file_exists } from "vyto/io/file";
-import { Table } from "vyto-proxy/src/routes";
+import { Table } from "domain-to-port/src/routes";
 
 extern "C" {
     fn vp_selfsign(names: cstring, cert_out: cstring, cert_cap: i32,

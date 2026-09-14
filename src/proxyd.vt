@@ -20,20 +20,20 @@ import { Socket, PollSet, RecvResult, socket_listen_on, socket_connect,
 import { cli, Cli } from "vyto/cli";
 import { exit, getenv } from "vyto/os";
 import { monoMs } from "vyto/util/time";  // monotonic: an idle timeout must not jump when the wall clock does
-import { Table, readTable, normalize } from "vyto-proxy/src/routes";
-import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
-import { writePidFile, removePidFile } from "vyto-proxy/src/signal";
-import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "vyto-proxy/src/head";
-import { Store, challengeResponse } from "vyto-proxy/src/challenge";
-import { Manager, manager } from "vyto-proxy/src/autocert";
-import { LE_PRODUCTION, LE_STAGING, trustCa } from "vyto-proxy/src/acme";
+import { Table, readTable, normalize } from "domain-to-port/src/routes";
+import { routesPath, pidPath, ensureStateDir, stateDir } from "domain-to-port/src/paths";
+import { writePidFile, removePidFile } from "domain-to-port/src/signal";
+import { headEnd, hostHeader, requestPath, HEAD_INCOMPLETE, HEAD_TOO_LARGE, MAX_HEAD } from "domain-to-port/src/head";
+import { Store, challengeResponse } from "domain-to-port/src/challenge";
+import { Manager, manager } from "domain-to-port/src/autocert";
+import { LE_PRODUCTION, LE_STAGING, trustCa } from "domain-to-port/src/acme";
 import { Tunnel, Buf, BUF_SIZE, PH_HANDSHAKE, PH_READ_HEAD, PH_CONNECTING,
          PH_PIPING, PH_ERROR, PH_CLOSED, IO_WANT_READ, IO_WANT_WRITE,
-         IO_ERROR, IO_EOF } from "vyto-proxy/src/tunnel";
+         IO_ERROR, IO_EOF } from "domain-to-port/src/tunnel";
 import { TlsContext, tls_accept, OSSL_WANT_READ, OSSL_WANT_WRITE } from "vyto/crypto/openssl";
-import { CertSource, acquire, CERT_SELF, CERT_FILES } from "vyto-proxy/src/tls";
-import { SniSet, load } from "vyto-proxy/src/sni";
-import { badGateway, noRoute, badRequest } from "vyto-proxy/src/errors";
+import { CertSource, acquire, CERT_SELF, CERT_FILES } from "domain-to-port/src/tls";
+import { SniSet, load } from "domain-to-port/src/sni";
+import { badGateway, noRoute, badRequest } from "domain-to-port/src/errors";
 
 export const VERSION: string = "0.1.0";
 

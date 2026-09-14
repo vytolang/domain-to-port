@@ -1,5 +1,8 @@
+# Build output
 .vyto-cache/
 domain-to-port
 vyto-proxyd
+
+# Test and release artefacts
 tests/tmp/
-tests/tmp/
+dist/

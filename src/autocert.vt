@@ -10,11 +10,11 @@
 // certificate in place and serving, because a certificate with a fortnight left
 // is worth far more than a correct error message.
 
-import { Client, client, CertResult, Challenge, LE_PRODUCTION, LE_STAGING } from "vyto-proxy/src/acme";
-import { AccountKey, loadOrCreateKey } from "vyto-proxy/src/jws";
-import { Store } from "vyto-proxy/src/challenge";
-import { CertInfo, infoFor, save, RENEW_BEFORE_DAYS } from "vyto-proxy/src/certstore";
-import { Table } from "vyto-proxy/src/routes";
+import { Client, client, CertResult, Challenge, LE_PRODUCTION, LE_STAGING } from "domain-to-port/src/acme";
+import { AccountKey, loadOrCreateKey } from "domain-to-port/src/jws";
+import { Store } from "domain-to-port/src/challenge";
+import { CertInfo, infoFor, save, RENEW_BEFORE_DAYS } from "domain-to-port/src/certstore";
+import { Table } from "domain-to-port/src/routes";
 import { path_join, file_mkdirs } from "vyto/io/file";
 
 export class Manager {

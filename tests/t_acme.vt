@@ -4,10 +4,10 @@
 // the pieces where a silent mistake would be hardest to spot from a failure
 // message — signature shape, JWK ordering, challenge matching.
 
-import { newKey, signedRequest, strbytes_of } from "vyto-proxy/src/jws";
-import { Store, PREFIX, challengeResponse } from "vyto-proxy/src/challenge";
-import { stemFor, RENEW_BEFORE_DAYS } from "vyto-proxy/src/certstore";
-import { requestPath } from "vyto-proxy/src/head";
+import { newKey, signedRequest, strbytes_of } from "domain-to-port/src/jws";
+import { Store, PREFIX, challengeResponse } from "domain-to-port/src/challenge";
+import { stemFor, RENEW_BEFORE_DAYS } from "domain-to-port/src/certstore";
+import { requestPath } from "domain-to-port/src/head";
 
 fn check(label: string, got: int, want: int) {
     if (got == want) { print(`ok   {label}`); return; }

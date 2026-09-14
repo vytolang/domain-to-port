@@ -26,7 +26,7 @@
 import { http_get, http_post, http_request, http_set_ca_file, Response } from "vyto/net/http";
 import { json_parse, JsonValue } from "vyto/util/json";
 import { base64url_encode } from "vyto/util/mime";
-import { AccountKey, newKey, signedRequest, strbytes_of } from "vyto-proxy/src/jws";
+import { AccountKey, newKey, signedRequest, strbytes_of } from "domain-to-port/src/jws";
 import { sleepMs } from "vyto/util/time";
 
 // Let's Encrypt. Staging first while you are getting it working — production

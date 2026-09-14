@@ -1,4 +1,4 @@
-import { Table, normalize, readTable, writeTable, valid_port } from "vyto-proxy/src/routes";
+import { Table, normalize, readTable, writeTable, valid_port } from "domain-to-port/src/routes";
 
 fn check(label: string, got: int, want: int) {
     if (got == want) { print(`ok   {label}`); return; }

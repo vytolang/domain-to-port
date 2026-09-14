@@ -25,7 +25,7 @@
 
 import { file_exists, file_rename, file_remove, path_join } from "vyto/io/file";
 import { run, capture, tempDir, pid, getenv } from "vyto/os";
-import { normalize } from "vyto-proxy/src/routes";
+import { normalize } from "domain-to-port/src/routes";
 
 const DEFAULT_HOSTS: string = "/etc/hosts";
 

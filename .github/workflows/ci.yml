@@ -1,0 +1,58 @@
+# Build and test on every push.
+#
+# Vyto compiles to C and shells out to a host compiler, so the only thing to
+# install is the Vyto compiler itself — which is plain C99 and builds in
+# seconds. There is no package to fetch and no toolchain to cache.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A package root CONTAINS packages, so this repo is checked out one
+          # level down and the parent becomes the root.
+          path: vytoapps/domain-to-port
+
+      - name: Check out Vyto
+        uses: actions/checkout@v4
+        with:
+          repository: vytolang/vyto
+          path: vyto
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libcurl4-openssl-dev
+
+      - name: Build the Vyto compiler
+        run: make -C vyto vytoc
+
+      - name: Build vyto-proxy
+        working-directory: vytoapps/domain-to-port
+        run: make VYTO_ROOT=$GITHUB_WORKSPACE/vyto
+
+      - name: Install Pebble
+        # Let's Encrypt's own test ACME server. Without it the suite still runs
+        # and simply skips the end-to-end ACME section, so this step is what
+        # keeps that section from silently never running in CI.
+        run: go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+
+      - name: Test
+        working-directory: vytoapps/domain-to-port
+        run: make test VYTO_ROOT=$GITHUB_WORKSPACE/vyto
+
+      - name: Show the log on failure
+        if: failure()
+        working-directory: vytoapps/domain-to-port
+        run: |
+          for f in tests/tmp/proxyd.log tests/tmp/acmed.log tests/tmp/pebble.log; do
+            [ -f "$f" ] && { echo "--- $f ---"; tail -40 "$f"; }
+          done || true

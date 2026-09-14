@@ -1,0 +1,85 @@
+# Build binaries and attach them to a GitHub release when a version tag is
+# pushed.
+#
+# The binaries are dynamically linked against libc and OpenSSL, which every
+# current distribution ships — Ubuntu 22.04+, Debian 12+, Fedora 36+. That
+# keeps the artifact small and leaves OpenSSL security updates to the
+# distribution rather than to this release.
+#
+# Built on the OLDEST supported runner on purpose: glibc and OpenSSL are
+# backward compatible, so a binary built against an older one runs on newer
+# systems, while the reverse fails at load time with a version error.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vytoapps/domain-to-port
+          fetch-depth: 0        # tags, so `git describe` can name the version
+
+      - name: Check out Vyto
+        uses: actions/checkout@v4
+        with:
+          repository: vytolang/vyto
+          path: vyto
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libcurl4-openssl-dev
+
+      - name: Build the Vyto compiler
+        run: make -C vyto vytoc
+
+      - name: Install Pebble
+        run: go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+
+      # Nothing ships that has not passed the suite on the machine that built
+      # it. A release is the worst place to find out a test was failing.
+      - name: Test
+        working-directory: vytoapps/domain-to-port
+        run: make test VYTO_ROOT=$GITHUB_WORKSPACE/vyto
+
+      - name: Build the release tarball
+        working-directory: vytoapps/domain-to-port
+        run: make dist VYTO_ROOT=$GITHUB_WORKSPACE/vyto
+
+      - name: Record what the binaries need
+        working-directory: vytoapps/domain-to-port
+        run: |
+          echo "### Linked libraries" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ldd vyto-proxyd >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vytoapps/domain-to-port/dist/*.tar.gz
+            vytoapps/domain-to-port/dist/*.sha256
+          body: |
+            Prebuilt binaries for linux-x86_64.
+
+            ```sh
+            tar xzf domain-to-port-*-linux-x86_64.tar.gz
+            cd domain-to-port-*-linux-x86_64
+            sudo install -m 755 domain-to-port vyto-proxyd /usr/local/bin/
+            sudo setcap cap_net_bind_service=+ep /usr/local/bin/vyto-proxyd
+            ```
+
+            Needs glibc 2.35+ and OpenSSL 3.x — Ubuntu 22.04+, Debian 12+,
+            Fedora 36+. On anything older, build from source.
+
+            Verify the download with `sha256sum -c domain-to-port-*.tar.gz.sha256`.

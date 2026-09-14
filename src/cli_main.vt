@@ -16,11 +16,11 @@
 
 import { cli, Cli } from "vyto/cli";
 import { exit } from "vyto/os";
-import { Table, Route, readTable, writeTable, normalize, valid_port } from "vyto-proxy/src/routes";
-import { routesPath, pidPath, ensureStateDir, stateDir } from "vyto-proxy/src/paths";
+import { Table, Route, readTable, writeTable, normalize, valid_port } from "domain-to-port/src/routes";
+import { routesPath, pidPath, ensureStateDir, stateDir } from "domain-to-port/src/paths";
 import { signalDaemon, SIGHUP, REACH_OK, REACH_NO_FILE, REACH_STALE,
-         REACH_DENIED, REACH_BAD_FILE } from "vyto-proxy/src/signal";
-import { sync, HostsResult, hostsPath } from "vyto-proxy/src/hosts";
+         REACH_DENIED, REACH_BAD_FILE } from "domain-to-port/src/signal";
+import { sync, HostsResult, hostsPath } from "domain-to-port/src/hosts";
 
 export const VERSION: string = "0.1.0";
 

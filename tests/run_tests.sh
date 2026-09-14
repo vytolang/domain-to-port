@@ -12,7 +12,18 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
-VYTOC=${VYTOC:-/home/eric/voltlang/vytoc}
+# The compiler, found the same way the Makefile finds it: an explicit $VYTOC,
+# then $VYTO_ROOT or $VYTO_HOME, then PATH.
+if [ -z "${VYTOC:-}" ]; then
+    if [ -n "${VYTO_ROOT:-}" ]; then VYTOC="$VYTO_ROOT/vytoc"
+    elif [ -n "${VYTO_HOME:-}" ]; then VYTOC="$VYTO_HOME/vytoc"
+    else VYTOC=$(command -v vytoc 2>/dev/null || true)
+    fi
+fi
+if [ -z "$VYTOC" ] || [ ! -x "$VYTOC" ]; then
+    echo "tests: cannot find the Vyto compiler (set VYTOC, VYTO_ROOT or VYTO_HOME)"
+    exit 1
+fi
 # The package ROOT is the directory CONTAINING this package, not this one --
 # same shape as lib/ holding vyto/. Derived rather than hardcoded so moving the
 # checkout needs no edit here.
@@ -459,8 +470,19 @@ esac
 #
 # Pebble validates HTTP-01 against port 5002, which is why the proxy listens
 # there rather than on 80 — no privilege needed.
-PEBBLE="${PEBBLE:-$HOME/go/bin/pebble}"
-PEBBLE_SRC=$(ls -d "$HOME"/go/pkg/mod/github.com/letsencrypt/pebble/v2@* 2>/dev/null | tail -1)
+# Find Pebble wherever `go install` put it: $GOPATH/bin, the default
+# ~/go/bin, or PATH. Hardcoding one of those means the ACME section silently
+# skips on a machine that has it — and a section that skips looks exactly like
+# a section that passed.
+GOPATH_DIR=$(go env GOPATH 2>/dev/null || echo "$HOME/go")
+PEBBLE="${PEBBLE:-}"
+if [ -z "$PEBBLE" ]; then
+    for cand in "$GOPATH_DIR/bin/pebble" "$HOME/go/bin/pebble" "$(command -v pebble 2>/dev/null || true)"; do
+        [ -n "$cand" ] && [ -x "$cand" ] && { PEBBLE="$cand"; break; }
+    done
+fi
+PEBBLE_SRC=$(ls -d "$GOPATH_DIR"/pkg/mod/github.com/letsencrypt/pebble/v2@* 2>/dev/null | tail -1)
+[ -z "$PEBBLE_SRC" ] && PEBBLE_SRC=$(ls -d "$HOME"/go/pkg/mod/github.com/letsencrypt/pebble/v2@* 2>/dev/null | tail -1)
 if [ -x "$PEBBLE" ] && [ -n "$PEBBLE_SRC" ]; then
     echo "acme (pebble)"
     mkdir -p "$TMP/pebble"

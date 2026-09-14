@@ -24,7 +24,7 @@
 
 import { TlsContext, tls_server } from "vyto/crypto/openssl";
 import { file_exists, path_join } from "vyto/io/file";
-import { normalize } from "vyto-proxy/src/routes";
+import { normalize } from "domain-to-port/src/routes";
 
 extern "C" {
     fn vp_sni_new(): rawptr;

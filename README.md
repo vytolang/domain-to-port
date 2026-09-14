@@ -15,13 +15,45 @@ you don't.
 
 ## Install
 
+### A prebuilt binary
+
 ```sh
+curl -LO https://github.com/vytolang/domain-to-port/releases/latest/download/domain-to-port-linux-x86_64.tar.gz
+tar xzf domain-to-port-linux-x86_64.tar.gz
+cd domain-to-port-*-linux-x86_64
+sudo install -m 755 domain-to-port vyto-proxyd /usr/local/bin/
+sudo setcap cap_net_bind_service=+ep /usr/local/bin/vyto-proxyd
+```
+
+Needs glibc 2.35+ and OpenSSL 3.x, which means Ubuntu 22.04+, Debian 12+,
+Fedora 36+ or anything newer. Check a release's `.sha256` before trusting the
+download.
+
+### From source
+
+Needs the [Vyto compiler](https://github.com/vytolang/vyto) and OpenSSL
+headers. Vyto compiles to C and shells out to a host C compiler, so there is no
+other toolchain to install.
+
+```sh
+git clone https://github.com/vytolang/domain-to-port
+cd domain-to-port
 make && make install                 # -> ~/.local/bin
 sudo setcap cap_net_bind_service=+ep ~/.local/bin/vyto-proxyd
 ```
 
+`make` finds `vytoc` on your `PATH`, or via `$VYTO_HOME`, or you can point at a
+checkout: `make VYTO_ROOT=/path/to/vyto`. `PREFIX` and `DESTDIR` work as usual.
+
+**A package root contains packages**, so this has to sit inside one — `make`
+derives the root as the parent directory. Cloning into `~/src/domain-to-port`
+makes `~/src` the root, which is what you want; cloning into `/` would not.
+
+### After either
+
 The `setcap` grants the one privilege a proxy needs — binding a port below 1024
-— without the daemon ever running as root. Do it once.
+— without the daemon ever running as root. Do it once, and again after any
+upgrade that replaces the binary.
 
 If something else already owns `:80` — Apache and nginx usually do — see
 [Port 80](#port-80).
@@ -40,7 +72,7 @@ Then point domains at ports:
 
 ```sh
 domain-to-port -d www.example.com -p 8099
-domain-to-port -d '*.dev.local'   -p 3000     # wildcard
+domain-to-port -d '*.dev.test'    -p 3000     # wildcard
 domain-to-port -d www.example.com --rm        # remove
 domain-to-port --list                         # show the table
 ```
@@ -206,9 +238,9 @@ truth and a hosts problem should not undo an edit you asked for; re-run with
 `--hosts` to reconcile the two.
 
 **Wildcards are skipped.** `/etc/hosts` matches literal names only, so a route
-like `*.dev.local` gets a warning rather than a line that could never match.
+like `*.dev.test` gets a warning rather than a line that could never match.
 For wildcards you need a real resolver — dnsmasq with
-`address=/dev.local/127.0.0.1`, or systemd-resolved — or just list the names
+`address=/dev.test/127.0.0.1`, or systemd-resolved — or just list the names
 you actually use.
 
 ### Pick the right suffix
@@ -221,9 +253,7 @@ most Linux desktops, including the one this was developed on — `nsswitch.conf`
 typically reads `hosts: files mdns4_minimal [NOTFOUND=return] dns`. A hosts
 entry still wins, because `files` comes first, but anything that falls past it
 stops at mDNS instead of reaching DNS, and `.local` names you did not put in
-the file resolve to link-local addresses rather than loopback. The examples in
-this README use `.local` in places for continuity with earlier versions; `.test`
-is the better choice for anything new.
+the file resolve to link-local addresses rather than loopback. The examples in this README use `.test` throughout for that reason.
 
 Also fine: `.localhost`, and any domain you actually control.
 
@@ -259,7 +289,7 @@ selected during the handshake from the name the client sent:
 
 ```
 certs/www.example.com.crt   certs/www.example.com.key
-certs/_.dev.local.crt       certs/_.dev.local.key     ->  *.dev.local
+certs/_.dev.test.crt        certs/_.dev.test.key      ->  *.dev.test
 ```
 
 `_` stands in for `*` because a shell expands an asterisk in a filename.
@@ -405,22 +435,47 @@ capped at 16 KB.
 make test
 ```
 
-154 checks: unit tests for the table, the header parser and the hosts-file
-rewriter, then end-to-end
-runs against real backends on loopback — routing, wildcards, keep-alive, a
-3 MB download, a 100 KB POST, 100-way concurrency, fd and RSS hygiene, live
-reload, the same payload and concurrency set again over TLS, and SNI serving
-three distinct certificates to the domains that asked for them,
-`/etc/hosts` reconciliation against a copy (never the real file — `$VYTO_PROXY_HOSTS`
-redirects it), and a full ACME issuance against Pebble, Let's Encrypt's own test
-server — the daemon obtains a certificate, answers its own challenge, and serves
-the result without a restart. The ACME section is skipped when Pebble is not
-installed (`go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest`), so
-the suite stays runnable with no Go toolchain. No network access, and every port is picked free at run
-time so the suite does not fight whatever else is on the machine.
+154 checks, no network access, every port picked free at run time so the suite
+never fights whatever else is on the machine.
 
-Two checks are worth keeping honest, and both have been fault-injected to
-confirm they still fail when their fix is removed: the fd-hygiene one (a client
-that walked away mid-download used to leave both sockets open until the 60 s
-sweep) and the TLS payload ones (reading the raw socket instead of the SSL
-object hands the parser ciphertext, which hangs only on the TLS path).
+Unit tests cover the route table, the HTTP header parser, the `/etc/hosts`
+rewriter and the ACME crypto. Everything else runs end to end against real
+backends on loopback:
+
+| Area | What is checked |
+|---|---|
+| routing | exact hosts, wildcards, case, ports, 400/404/502 |
+| protocol | keep-alive, headers split across packets, a 3 MB download, a 100 KB POST |
+| load | 100 concurrent requests, fd and RSS hygiene under abandoned transfers |
+| TLS | the same payloads and concurrency again, plus SNI serving three distinct certificates |
+| hosts | reconciliation against a copy — never the real file, `$VYTO_PROXY_HOSTS` redirects it |
+| ACME | a full issuance against Pebble: the daemon obtains a certificate, answers its own challenge, and serves it without a restart |
+
+The ACME section is skipped when Pebble is absent, so the suite runs with no Go
+toolchain:
+
+```sh
+go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+```
+
+Several checks have been fault-injected — the fix deliberately removed to
+confirm the test fails without it. A test of this shape passes trivially the
+moment it stops finding anything, so the ones guarding real bugs earn it:
+
+- **fd hygiene.** A client that walked away mid-download left both sockets open
+  until the 60 s sweep. Removing the fix: fds grow 11 → 31.
+- **the TLS seam.** Reading the raw socket instead of the SSL object hands the
+  parser ciphertext, and hangs only on the TLS path. Removing it: 63 passed,
+  7 failed, plain HTTP untouched.
+- **SNI selection.** Removing the context switch: 77 passed, 3 failed — exactly
+  the three "serves its own certificate" checks.
+
+## Contributing
+
+Issues and pull requests are welcome. `make test` should be green before and
+after your change; if you are touching the proxy loop, run it with Pebble
+installed so the ACME path is exercised rather than skipped.
+
+The code is commented for *why*, not *what* — if a line exists because of a bug
+that was hard to find, the comment says so. Several of them are the only record
+of a failure that took hours to diagnose, so please keep that style.
