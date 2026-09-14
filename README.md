@@ -383,8 +383,7 @@ last asked for rather than deriving it from buffer state, the way the plain
 path can. Code that always re-arms for readability works for months and then
 hangs on a long-lived connection under load.
 
-**Backpressure is the load-bearing detail.** A direction stops *reading* when
-the buffer it feeds is full, so a fast backend cannot make the proxy hold
+A direction stops *reading* when the buffer it feeds is full, so a fast backend cannot make the proxy hold
 megabytes on behalf of a slow client. Ten slow clients pulling 3 MB each grow
 RSS by about 1 MB, not 30 MB.
 
