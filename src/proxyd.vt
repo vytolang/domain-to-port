@@ -53,6 +53,10 @@ const MAX_CONNS: int = 256;
 // to do.
 const CERT_CHECK_MS: i64 = 86400000;
 
+// "No certificate check has happened yet". Not 0: monoMs() is uptime, so 0 is
+// a time the clock genuinely passes through.
+const CERT_NEVER: i64 = -1;
+
 extern "C" {
     fn vp_ignore_sigpipe();
     fn vp_install_hup();
@@ -90,7 +94,7 @@ export class Proxy {
     // than on a schedule kept elsewhere: the expiry lives in the certificate
     // file, so there is nothing to get out of step.
     autocert: Manager;
-    last_cert_check: i64;
+    last_cert_check: i64;    // CERT_NEVER until the first sweep has run
     certs_dir: string;      // remembered so certificates can be reloaded
     poll: PollSet;
 
@@ -115,7 +119,7 @@ export class Proxy {
         this.sni = null;
         this.acme = new Store();
         this.autocert = null;
-        this.last_cert_check = 0;
+        this.last_cert_check = CERT_NEVER;
         this.certs_dir = "";
         this.poll = null;
         this.slots = [];
@@ -266,7 +270,17 @@ export class Proxy {
             // Renewal is slow (a CA round trip per domain) and blocks the
             // loop, which is acceptable once a day at 30 days of margin but
             // would not be if it ran on every sweep.
-            if (this.autocert != null && now - this.last_cert_check >= CERT_CHECK_MS) {
+            // The first check runs at once; after that, daily.
+            //
+            // `now` is monotonic uptime, so comparing it against a zero
+            // "last checked" asks whether the MACHINE has been up for a day —
+            // which on a freshly booted one is false, and the daemon then sat
+            // for 24 hours before requesting its first certificate. A separate
+            // sentinel says "never checked" without depending on the clock's
+            // origin.
+            let due = this.last_cert_check == CERT_NEVER
+                   || now - this.last_cert_check >= CERT_CHECK_MS;
+            if (this.autocert != null && due) {
                 this.last_cert_check = now;
                 // renewDue blocks for as long as the CA takes. It is given a
                 // pump (installed in main) so that the challenge requests it is

@@ -13,6 +13,10 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
 VYTOC=${VYTOC:-/home/eric/voltlang/vytoc}
+# The package ROOT is the directory CONTAINING this package, not this one --
+# same shape as lib/ holding vyto/. Derived rather than hardcoded so moving the
+# checkout needs no edit here.
+MODPATH=${MODPATH:-$(cd .. && pwd)}
 TMP="$ROOT/tests/tmp"
 # Ports are picked free at run time rather than fixed. A fixed port makes the
 # suite fail for a reason that has nothing to do with the proxy the moment
@@ -49,16 +53,16 @@ rm -rf "$TMP"
 mkdir -p "$TMP/state" "$TMP/www"
 
 echo "building"
-$VYTOC build src/cli_main.vt --modpath /home/eric -o "$TMP/domain-to-port" >/dev/null || { echo "BUILD FAILED (cli)"; exit 1; }
-$VYTOC build src/proxyd.vt   --modpath /home/eric -o "$TMP/vyto-proxyd"   >/dev/null || { echo "BUILD FAILED (daemon)"; exit 1; }
+$VYTOC build src/cli_main.vt --modpath "$MODPATH" -o "$TMP/domain-to-port" >/dev/null || { echo "BUILD FAILED (cli)"; exit 1; }
+$VYTOC build src/proxyd.vt   --modpath "$MODPATH" -o "$TMP/vyto-proxyd"   >/dev/null || { echo "BUILD FAILED (daemon)"; exit 1; }
 DTP="$TMP/domain-to-port"
 
 echo "unit tests"
-$VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1 | sed 's/^/  /'
-$VYTOC run tests/t_head.vt   --modpath /home/eric 2>&1 | sed 's/^/  /'
-$VYTOC run tests/t_hosts.vt  --modpath /home/eric 2>&1 | sed 's/^/  /'
-$VYTOC run tests/t_acme.vt   --modpath /home/eric 2>&1 | sed 's/^/  /'
-U=$($VYTOC run tests/t_routes.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_head.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_hosts.vt --modpath /home/eric 2>&1; $VYTOC run tests/t_acme.vt --modpath /home/eric 2>&1)
+$VYTOC run tests/t_routes.vt --modpath "$MODPATH" 2>&1 | sed 's/^/  /'
+$VYTOC run tests/t_head.vt   --modpath "$MODPATH" 2>&1 | sed 's/^/  /'
+$VYTOC run tests/t_hosts.vt  --modpath "$MODPATH" 2>&1 | sed 's/^/  /'
+$VYTOC run tests/t_acme.vt   --modpath "$MODPATH" 2>&1 | sed 's/^/  /'
+U=$($VYTOC run tests/t_routes.vt --modpath "$MODPATH" 2>&1; $VYTOC run tests/t_head.vt --modpath "$MODPATH" 2>&1; $VYTOC run tests/t_hosts.vt --modpath "$MODPATH" 2>&1; $VYTOC run tests/t_acme.vt --modpath "$MODPATH" 2>&1)
 UF=$(printf '%s\n' "$U" | grep -c '^FAIL')
 UP=$(printf '%s\n' "$U" | grep -c '^ok')
 PASS=$((PASS+UP)); FAIL=$((FAIL+UF))
