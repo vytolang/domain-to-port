@@ -24,13 +24,13 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: vytoapps/domain-to-port
           fetch-depth: 0        # tags, so `git describe` can name the version
 
       - name: Check out Vyto
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: vytolang/vyto
           path: vyto

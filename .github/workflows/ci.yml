@@ -15,14 +15,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # A package root CONTAINS packages, so this repo is checked out one
           # level down and the parent becomes the root.
           path: vytoapps/domain-to-port
 
       - name: Check out Vyto
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: vytolang/vyto
           path: vyto
